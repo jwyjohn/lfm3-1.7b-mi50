@@ -1,0 +1,21 @@
+case                            input    TTFT s prefill t/s  decode t/s
+  multi-t32768-o1024-claudecode    30222     6.743        4482       259.7  out=1024 cached=0
+  multi-t32768-o1024-claudecode    30921     0.320       96743       259.0  out=1024 cached=30208
+  multi-t32768-o1024-claudecode    31824     0.360       88473       258.1  out=1024 cached=30912
+  multi-t32768-o1024-openhands    29006     5.132        5652       259.8  out=1024 cached=0
+  multi-t32768-o1024-openhands    30501     0.491       62130       258.6  out=1024 cached=28992
+  multi-t32768-o1024-openhands    34211     1.048       32657       255.6  out=1024 cached=30496
+  multi-t32768-o1024-minisweagent    15634     2.404        6504       270.6  out=1024 cached=0
+  multi-t32768-o1024-minisweagent    17232     0.424       40648       269.0  out=1024 cached=15616
+  multi-t32768-o1024-minisweagent    32407     3.371        9613       256.7  out=1024 cached=17216
+multi-t32768-o1024              32407     1.048       32657       259.0
+  multi-t128000-o1024-claudecode   125473    45.576        2753       201.1  out=1024 cached=0
+  multi-t128000-o1024-claudecode   126063     0.703      179273       200.7  out=1024 cached=125472
+  multi-t128000-o1024-claudecode   126525     0.562      225113       200.6  out=1024 cached=126048
+  multi-t128000-o1024-openhands   122190    43.620        2801       202.8  out=1024 cached=0
+  multi-t128000-o1024-openhands   124052     1.386       89524       202.0  out=1024 cached=122176
+  multi-t128000-o1024-openhands   124745     0.724      172319       201.4  out=1024 cached=124032
+  multi-t128000-o1024-minisweagent   121519    43.270        2808       203.1  out=1024 cached=0
+  multi-t128000-o1024-minisweagent   125407     2.604       48155       201.0  out=1024 cached=121504
+  multi-t128000-o1024-minisweagent   126130     0.817      154349       201.0  out=1024 cached=125376
+multi-t128000-o1024            126130     1.386       89524       201.1

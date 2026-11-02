@@ -1,0 +1,32 @@
+{
+ "args": {
+  "model": "LiquidAI/LFM3-1.7B",
+  "math": 20,
+  "gpqa": 20,
+  "seed": 20261030,
+  "max_tokens": 32768,
+  "temperature": 0.6,
+  "top_p": 0.95,
+  "top_k": 20
+ },
+ "summary": {
+  "math500": {
+   "n": 20,
+   "accuracy": 0.9,
+   "truncated": 1,
+   "loops": 0,
+   "mean_dup8": 0.0149,
+   "decode_tps": 261.4424,
+   "mean_completion_tokens": 5214.25
+  },
+  "gpqa": {
+   "n": 20,
+   "accuracy": 0.65,
+   "truncated": 2,
+   "loops": 0,
+   "mean_dup8": 0.021,
+   "decode_tps": 260.2522,
+   "mean_completion_tokens": 11531.65
+  }
+ }
+}

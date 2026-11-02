@@ -1,0 +1,21 @@
+case                            input    TTFT s prefill t/s  decode t/s
+  single-t1024-o1024-claudecode     1024     0.125        8199       302.9  out=1024 cached=0
+  single-t1024-o1024-openhands     1024     0.126        8138       302.1  out=1024 cached=0
+  single-t1024-o1024-minisweagent     1024     0.126        8130       302.2  out=1024 cached=0
+single-t1024-o1024               1024     0.126        8138       302.2
+  single-t8192-o1024-claudecode     8192     1.051        7798       293.7  out=1024 cached=0
+  single-t8192-o1024-openhands     8192     1.049        7812       292.9  out=1024 cached=0
+  single-t8192-o1024-minisweagent     8192     1.045        7837       293.2  out=1024 cached=0
+single-t8192-o1024               8192     1.049        7812       293.2
+  single-t32768-o1024-claudecode    32768     5.795        5655       270.3  out=1024 cached=0
+  single-t32768-o1024-openhands    32768     5.801        5649       270.0  out=1024 cached=0
+  single-t32768-o1024-minisweagent    32768     5.798        5651       270.1  out=1024 cached=0
+single-t32768-o1024             32768     5.798        5651       270.1
+  single-t65536-o1024-claudecode    65536    15.806        4146       244.9  out=1024 cached=0
+  single-t65536-o1024-openhands    65536    15.800        4148       244.3  out=1024 cached=0
+  single-t65536-o1024-minisweagent    65536    15.809        4146       244.9  out=1024 cached=0
+single-t65536-o1024             65536    15.806        4146       244.9
+  single-t128000-o1024-claudecode   126976    45.957        2763       208.0  out=1024 cached=0
+  single-t128000-o1024-openhands   126976    45.998        2760       208.1  out=1024 cached=0
+  single-t128000-o1024-minisweagent   126976    45.982        2761       208.3  out=1024 cached=0
+single-t128000-o1024           126976    45.982        2761       208.1

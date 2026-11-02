@@ -1,0 +1,19 @@
+# Build outputs. dist/lfm3-1.7b-mi50 is about 2.3 GB and embeds the model weights.
+/build/
+/dist/
+
+# Model weights and derived payloads never belong in the repository.
+*.safetensors
+*.gguf
+payload.bin
+
+# Tests and tools
+*.test
+*.out
+*.prof
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+.DS_Store

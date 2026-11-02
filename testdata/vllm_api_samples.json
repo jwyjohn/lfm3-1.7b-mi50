@@ -1,0 +1,100 @@
+{
+ "chat_plain": {
+  "object": "chat.completion",
+  "model": "LiquidAI/LFM3-1.7B",
+  "choices": [
+   {
+    "index": 0,
+    "message": {
+     "role": "assistant",
+     "content": "2 + 2 = 4.",
+     "refusal": null,
+     "annotations": null,
+     "audio": null,
+     "function_call": null,
+     "reasoning": "We need to answer the question: \"What is 2+2?\" The user asks to reply briefly. So just give the simple arithmetic result. No need for complexity. 2+2 = 4. I'll respond concisely."
+    },
+    "logprobs": null,
+    "finish_reason": "stop",
+    "stop_reason": null,
+    "token_ids": null,
+    "routed_experts": null,
+    "weight_versions": null
+   }
+  ],
+  "service_tier": null,
+  "usage": {
+   "prompt_tokens": 21,
+   "total_tokens": 79,
+   "completion_tokens": 58,
+   "prompt_tokens_details": {
+    "cached_tokens": 0,
+    "created_cache_tokens": 0,
+    "multimodal_tokens": null
+   },
+   "completion_tokens_details": {
+    "reasoning_tokens": 48
+   }
+  },
+  "prompt_logprobs": null,
+  "prompt_token_ids": null,
+  "prompt_text": null,
+  "kv_transfer_params": null,
+  "ec_transfer_params": null,
+  "metrics": null
+ },
+ "chat_tool": {
+  "object": "chat.completion",
+  "model": "LiquidAI/LFM3-1.7B",
+  "choices": [
+   {
+    "index": 0,
+    "message": {
+     "role": "assistant",
+     "content": null,
+     "refusal": null,
+     "annotations": null,
+     "audio": null,
+     "function_call": null,
+     "tool_calls": [
+      {
+       "id": "chatcmpl-tool-bee51abfdb42a630",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": "{\"city\": \"Paris\", \"days\": 3}"
+       }
+      }
+     ],
+     "reasoning": "We need to get the weather for Paris for the next 3 days. The user specifically asked to use the tool. Looking at the available tools, there is `get_weather` which requires parameters `city` and optionally `days`. The function signature shows:\n```\n{\n  \"name\": \"get_weather\",\n  \"parameters\": {\n    \"type\": \"object\",\n    \"properties\": {\n      \"city\": { \"type\": \"string\" },\n      \"days\": { \"type\": \"integer\" }\n    },\n    \"required\": [\"city\"]\n  }\n}\n```\nSo I need to call `get_weather` with arguments: `city`: \"Paris\", `days`: 3.\n\nLet me construct the tool call."
+    },
+    "logprobs": null,
+    "finish_reason": "tool_calls",
+    "stop_reason": null,
+    "token_ids": null,
+    "routed_experts": null,
+    "weight_versions": null
+   }
+  ],
+  "service_tier": null,
+  "usage": {
+   "prompt_tokens": 90,
+   "total_tokens": 267,
+   "completion_tokens": 177,
+   "prompt_tokens_details": {
+    "cached_tokens": 0,
+    "created_cache_tokens": 64,
+    "multimodal_tokens": null
+   },
+   "completion_tokens_details": {
+    "reasoning_tokens": 151
+   }
+  },
+  "prompt_logprobs": null,
+  "prompt_token_ids": null,
+  "prompt_text": null,
+  "kv_transfer_params": null,
+  "ec_transfer_params": null,
+  "metrics": null
+ }
+}
