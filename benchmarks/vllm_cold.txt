@@ -1,21 +1,21 @@
 case                            input    TTFT s prefill t/s  decode t/s
-  single-t1024-o1024-claudecode     1024     0.239        4282       286.9  out=1024 cached=0
-  single-t1024-o1024-openhands     1024     0.211        4859       286.4  out=1024 cached=0
-  single-t1024-o1024-minisweagent     1024     0.209        4892       286.4  out=1024 cached=0
-single-t1024-o1024               1024     0.211        4859       286.4
-  single-t8192-o1024-claudecode     8192     1.154        7100       278.5  out=1024 cached=0
-  single-t8192-o1024-openhands     8192     1.158        7074       278.8  out=1024 cached=0
-  single-t8192-o1024-minisweagent     8192     1.159        7069       278.8  out=1024 cached=0
-single-t8192-o1024               8192     1.158        7074       278.8
-  single-t32768-o1024-claudecode    32768     5.970        5488       257.5  out=1024 cached=0
-  single-t32768-o1024-openhands    32768     5.986        5474       257.0  out=1024 cached=0
-  single-t32768-o1024-minisweagent    32768     5.984        5476       257.0  out=1024 cached=0
-single-t32768-o1024             32768     5.984        5476       257.0
-  single-t65536-o1024-claudecode    65536    16.119        4066       233.7  out=1024 cached=0
-  single-t65536-o1024-openhands    65536    16.133        4062       233.7  out=1024 cached=0
-  single-t65536-o1024-minisweagent    65536    16.125        4064       233.6  out=1024 cached=0
-single-t65536-o1024             65536    16.125        4064       233.7
-  single-t128000-o1024-claudecode   126976    46.494        2731       200.3  out=1024 cached=0
-  single-t128000-o1024-openhands   126976    46.541        2728       200.5  out=1024 cached=0
-  single-t128000-o1024-minisweagent   126976    46.506        2730       200.5  out=1024 cached=0
-single-t128000-o1024           126976    46.506        2730       200.5
+  single-t1024-o1024-claudecode     1024     1.015        1009       889.1  out=1024 cached=0
+  single-t1024-o1024-openhands     1024     0.201        5090       974.2  out=1024 cached=0
+  single-t1024-o1024-minisweagent     1024     0.201        5102      1219.2  out=1024 cached=0
+single-t1024-o1024               1024     0.201        5090       974.2
+  single-t8192-o1024-claudecode     8192     1.155        7093       698.7  out=1024 cached=0
+  single-t8192-o1024-openhands     8192     1.158        7076       386.9  out=1024 cached=0
+  single-t8192-o1024-minisweagent     8192     1.157        7082       532.3  out=1024 cached=0
+single-t8192-o1024               8192     1.157        7082       532.3
+  single-t32768-o1024-claudecode    32768     5.817        5633       427.0  out=1024 cached=0
+  single-t32768-o1024-openhands    32768     5.829        5622       250.1  out=1024 cached=0
+  single-t32768-o1024-minisweagent    32768     5.853        5598       363.5  out=1024 cached=0
+single-t32768-o1024             32768     5.829        5622       363.5
+  single-t65536-o1024-claudecode    65536    15.574        4208       412.8  out=1024 cached=0
+  single-t65536-o1024-openhands    65536    15.598        4201       381.5  out=1024 cached=0
+  single-t65536-o1024-minisweagent    65536    15.562        4211       425.5  out=1024 cached=0
+single-t65536-o1024             65536    15.574        4208       412.8
+  single-t128000-o1024-claudecode   126976    44.738        2838       301.0  out=1024 cached=0
+  single-t128000-o1024-openhands   126976    44.750        2837       298.3  out=1024 cached=0
+  single-t128000-o1024-minisweagent   126976    44.722        2839       310.6  out=1024 cached=0
+single-t128000-o1024           126976    44.738        2838       301.0

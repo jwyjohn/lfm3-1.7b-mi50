@@ -6,15 +6,17 @@ Single-stream inference for [LiquidAI/LFM3-1.7B](https://huggingface.co/LiquidAI
 
 The result is one static ELF file holding the quantized weights, the tokenizer and every GPU kernel. It serves an OpenAI-compatible HTTP API and needs no Python, ROCm or libc at run time, only the kernel's amdgpu/KFD driver.
 
-It replaces a vLLM deployment of the same model on the same card, and measured faster at every context length tested:
+It replaces a vLLM deployment of the same model on the same card, running the same DSpark kernel and policy:
 
-| Context | TTFT, vLLM → this | Decode tok/s, vLLM → this |
+| Context | TTFT, vLLM → this | Greedy decode tok/s, vLLM → this |
 |---|---|---|
-| 1k | 0.211 → 0.126 s | 286.4 → 302.2 |
-| 32k | 5.984 → 5.798 s | 257.0 → 270.1 |
-| 128k | 46.506 → 45.982 s | 200.5 → 208.1 |
+| 1k | 0.201 → 0.126 s | 974 → 1207 |
+| 32k | 5.829 → 5.678 s | 364 → 613 |
+| 128k | 44.738 → 44.343 s | 301 → 307 |
 
-See [Evaluation](#evaluation) for the method, the full tables and what was not measured.
+TTFT, prefill, warm starts and the sampling path are better at every tier. The decode column above is a median of 3 streams and is **very noisy, so do not read it alone**: over 72 streams the two tie overall (mean 559 → 545), and with repetition-loop streams separated, normal text is 5% to 16% faster at every tier. See [Evaluation](#evaluation), and the [optimization report](docs/OPTIMIZATION_REPORT.md) (Chinese) for the whole history.
+
+Only `temperature: 0` requests use DSpark. The model's default temperature is 0.1, which takes the sampling path at about 260 tok/s. vLLM behaves the same way.
 
 ## Quick start
 
@@ -26,15 +28,15 @@ for f in config.json tokenizer.json model.safetensors; do
   curl -L -o "model/$f" "https://huggingface.co/LiquidAI/LFM3-1.7B/resolve/$rev/$f"
 done
 
-# 2. Build dist/lfm3-1.7b-mi50 (about 2.3 GB)
-./build.sh model
+# 2. Build dist/lfm3-1.7b-mi50 (about 2 GB). See "Model weights" for the drafter directory.
+./build.sh model drafter
 
 # 3. Run. /dev/kfd needs root or the render group.
 sudo ./dist/lfm3-1.7b-mi50 --port 18000
 
 # 4. Use it
 curl localhost:18000/v1/chat/completions \
-  -d '{"messages":[{"role":"user","content":"What is 2+2? Reply briefly."}]}'
+  -d '{"messages":[{"role":"user","content":"What is 2+2? Reply briefly."}],"temperature":0}'
 ```
 
 The executable is self-contained, so you can copy it to another machine with the same card and run it there.
@@ -48,16 +50,16 @@ The executable is self-contained, so you can copy it to another machine with the
 | GPU | AMD Radeon Instinct MI50 32 GB (gfx906) | The only supported device. KFD topology is checked at startup |
 | Kernel | Linux 7.2.11 (Debian), in-tree amdgpu | KFD ioctl ABI 1.x |
 | Privileges | root | Or membership of the group that owns `/dev/kfd` (not tested) |
-| Free VRAM | 32 GB card with nothing else on it | At least about 5.5 GB for the default 131072-token limit; the program refuses to start below that |
+| Free VRAM | 32 GB card with nothing else on it | At least about 7 GB for the default 131072-token limit; the program refuses to start below that |
 | CPU | Intel i5-1340P | One core spins while a request runs |
-| RAM | 16 GB | The weights are read through the page cache |
+| RAM | 16 GB | Startup peaks at about 7.3 GB including the mapped file, then about 1.8 GB |
 
 **To build**
 
 | | Version | Notes |
 |---|---|---|
 | Go | 1.27 (tested 1.27.3) | No third-party modules. `CGO_ENABLED=0` |
-| Model files | see below | Packing peaks at about 8 GB of RAM, including the mapped model file, and takes about 13 s on 16 threads |
+| Model files | see below | Packing peaks at about 8 GB of RAM, including the mapped model file, and takes about 10 s on 16 threads |
 
 **To change a GPU kernel** (only then)
 
@@ -86,6 +88,15 @@ hf download LiquidAI/LFM3-1.7B model.safetensors config.json tokenizer.json \
 
 `cmd/pack` quantizes the weights once at build time. Its output is byte-for-byte reproducible and matches the original Python quantizer on every matrix compared.
 
+The DSpark drafter weights are not in this repository either and are not publicly released yet. The code was verified against a mid-training checkpoint, `lfm3-1.7b-dspark-l4b44-step10260`:
+
+| File | Size (bytes) | SHA-256 |
+|---|---|---|
+| `model.safetensors` | 519113708 | `7a1e6d24a916b0814fd106b6194cdcd309eec7919f013d89798896d84efbdf0f` |
+| `config.json` | 1855 | `930d3e014c73ec67f2fa66e782997dc779e2a0bd5195e5c508f76a69b0e8fc37` |
+
+The 16384 frequent tokens of the head crop are committed as `cmd/pack/crop_ids.bin`. To change weights, delete `build/payload.bin` and run `./build.sh model <new directory>`, then replay the policy.
+
 The weights are under the LFM Open License v1.0, which limits commercial use above a revenue threshold. A built executable contains weights derived from them, so read that license before you redistribute one.
 
 ## Design decisions
@@ -106,24 +117,37 @@ The cost is a narrow driver. It supports only this GPU, provides no scratch memo
 
 Go cannot target the GPU, and the existing kernels are heavily tuned, so they stay as HIP C++ and are embedded as gfx906 code objects with `go:embed`:
 
-- `decode.hip`: the decode megakernel. One persistent launch runs all 24 layers, the LM head and greedy sampling.
+- `dspark.hip`: the DSpark megakernel. One launch does draft, verify and commit on the GPU, up to 32 rounds. Greedy requests use it.
+- `decode.hip`: the decode megakernel. One persistent launch runs all 24 layers and the LM head, one token at a time. Sampling, logprobs and `min_tokens` requests use it.
 - `prefill_attn.hip`: flash attention over the paged int8 KV cache.
 - `gemm.hip`: W8A8 matrix multiply for every prefill linear layer.
 - `ops.hip`: new. Native versions of what vLLM ran through torch or JIT-compiled Triton: embedding, RMS norm, causal conv, Q/K norm and RoPE, int8 KV store, gate, and the fp16 LM head.
 
-Nothing is compiled at run time. The model is ready about 5 s after launch, against about 38 s for the vLLM deployment.
+Nothing is compiled at run time. The model is ready about 7.5 s after launch, against about 22 s for the vLLM deployment.
 
-The kernels are committed in compiled form (about 170 KB) so that a Go toolchain alone can build the project.
+The kernels are committed in compiled form (about 420 KB) so that a Go toolchain alone can build the project.
+
+The Go driver has no scratch memory, so `dspark.hip` must be built with `-mllvm -disable-machine-licm` and keep `private_segment_fixed_size` at 0.
+
+### DSpark inside the megakernel
+
+Decode spends most of its time reading weights, and verifying M tokens reads them only once: at 8k, M=1 takes 3.73 ms per round and M≈4 only 4.06 ms. So a 3-layer drafter guesses and the target verifies in one pass, `tok/s = τ / R`. Draft and verify alternate more than 200 times per second, too often to return to the CPU, so everything is in one kernel and the CPU only sends out committed tokens. A rejected token needs no rollback: conv history is a position-indexed ring and K/V goes to a temporary page until commit.
+
+One thing goes beyond the vLLM version: verify may cross the 32-token block boundary, and the kernel writes the conv state at the boundary from its history ring. Replay shows a gain of 0.6% to 1.3%.
+
+The policy (at most 7 drafts below 32768 tokens, 3 from there on, confidence threshold −0.4) comes from fixed-sequence replay rather than benchmark numbers, for the reason given in [Evaluation](#evaluation).
 
 ### Append the weights after the ELF image
 
-The model data is about 2.3 GB, and the Go linker caps data sections at about 2 GB, which rules out `go:embed`. `cmd/pack` appends the data to the built executable, with a footer locating it, and the program maps its own file read-only at startup.
+The model data is about 1.9 GB and the Go linker caps data sections at about 2 GB, which leaves too little room for `go:embed`. `cmd/pack` appends the data to the built executable, with a footer locating it, and the program maps its own file read-only at startup.
 
-Nothing is unpacked to disk. The catch is that `strip` and similar tools would drop the data, so `build.sh` strips the Go binary before attaching it.
+The weights are entropy coded in chunks with the standard library's Huffman coder and decoded in parallel at startup, into memory rather than to disk. The catch is that `strip` and similar tools would drop the data, so `build.sh` strips the Go binary before attaching it.
 
 ### Store one weight layout, derive the other
 
 Decode and prefill use the same int8 values in different layouts. Only the decode layout is stored, and the prefill layout is built at startup, which keeps about 1.5 GB out of the executable.
+
+Also not stored: the LM head (the quantized embedding, 260 MB) and the drafter's head crop and k/v projection (quantization is per row, so those rows are copied). Entropy coding saves only 7% on int8 weights, which are close to random noise, and 34% on the embedding, where BF16 to fp16 leaves the low 3 bits zero. With a drafter added, the file still shrank from 2.3 GB to 1.97 GB.
 
 ### Prefix cache suited to a single stream
 
@@ -135,7 +159,7 @@ Go's `regexp` has no lookahead, which the model's pre-tokenizer pattern needs, s
 
 ### What was left out
 
-Only single-stream inference on this card is in scope. Structured output (it needs a grammar engine), speculation, multimodal input and batching are not implemented.
+Only single-stream inference on this card is in scope. Structured output (it needs a grammar engine), multimodal input and batching are not implemented.
 
 ## What had to be right
 
@@ -170,17 +194,18 @@ Differences from vLLM's API:
 | `--gpu-memory-utilization` | `0.90` | Share of VRAM to use; the KV pool takes what remains |
 | `--kv-tokens` | from VRAM | Full-attention KV capacity, in tokens |
 | `--payload` | the executable | Read the model from a separate payload file (development) |
+| `--no-draft` | off | Keep greedy requests off DSpark, for comparison |
 
 ## Project layout
 
 ```
 build.sh           build dist/lfm3-1.7b-mi50
 cmd/lfm3-1.7b-mi50      the server
-cmd/pack           quantize weights, compile the tokenizer, attach the payload (build time)
+cmd/pack           quantize weights and the drafter, compile the tokenizer, attach the payload (build time)
 cmd/bench          benchmark client for any OpenAI-compatible server
 cmd/diag           GPU checks: determinism per code path, kernel vs wall time
 internal/kfd       pure-Go KFD driver: ioctls, memory, AQL queue, code object loader
-internal/model     weight layouts, prefill pipeline, decode, prefix cache, generation loop
+internal/model     weight layouts, prefill pipeline, decode, DSpark, prefix cache, generation loop
 internal/sample    sampler, in vLLM's order of operations
 internal/tokenizer BPE tokenizer
 internal/chat      the chat template, translated by hand
@@ -188,58 +213,91 @@ internal/server    HTTP API, reasoning and tool-call parsing
 kernels/           GPU kernels: .hip sources and compiled gfx906 code objects
 testdata/          tokenizer, template and API samples captured from the reference deployment
 benchmarks/        raw benchmark output
+docs/              optimization report
 ```
 
 ## Evaluation
 
-**Setup.** MI50 32 GB (gfx906, 60 CUs), Intel i5-1340P, 16 GB RAM, Linux 7.2.11. The baseline is vLLM (ROCm 7.2.4) with the same model, the same custom kernels (with the decode fix below), an int8 KV cache and speculation off. Each ran alone on the GPU. All numbers are absolute measurements from `cmd/bench`, with no comparisons under load.
+**Setup.** MI50 32 GB (gfx906, 60 CUs), Intel i5-1340P, 16 GB RAM, Linux 7.2.11. The baseline is vLLM (ROCm 7.2.4) with the same model, the same DSpark kernel, drafter step 10260 and the same policy. Each ran alone on the GPU. All numbers are absolute measurements from `cmd/bench`. Raw output is in `benchmarks/`.
 
 ### Performance
 
-Single stream, streaming responses, 1024 output tokens, cold cache. Requests are real agent traces from Open-SWE-Traces, sent as token ids. Each value is the median of 3 sessions. Raw output is in `benchmarks/`.
+Single stream, streaming responses, 1024 output tokens, cold cache, temperature 0. Requests are real agent traces from Open-SWE-Traces, sent as token ids. Each value is the median of 3 sessions.
 
 | Context | Input tokens | TTFT vLLM | TTFT this | Prefill tok/s vLLM | Prefill tok/s this | Decode tok/s vLLM | Decode tok/s this |
 |---|---|---|---|---|---|---|---|
-| 1k | 1024 | 0.211 s | 0.126 s | 4859 | 8138 | 286.4 | 302.2 |
-| 8k | 8192 | 1.158 s | 1.049 s | 7074 | 7812 | 278.8 | 293.2 |
-| 32k | 32768 | 5.984 s | 5.798 s | 5476 | 5651 | 257.0 | 270.1 |
-| 64k | 65536 | 16.125 s | 15.806 s | 4064 | 4146 | 233.7 | 244.9 |
-| 128k | 126976 | 46.506 s | 45.982 s | 2730 | 2761 | 200.5 | 208.1 |
+| 1k | 1024 | 0.201 s | 0.126 s | 5090 | 8135 | 974.2 | 1206.8 |
+| 8k | 8192 | 1.157 s | 1.044 s | 7082 | 7843 | 532.3 | 954.4 |
+| 32k | 32768 | 5.829 s | 5.678 s | 5622 | 5771 | 363.5 | 612.7 |
+| 64k | 65536 | 15.574 s | 15.371 s | 4208 | 4264 | 412.8 | 449.6 |
+| 128k | 126976 | 44.738 s | 44.343 s | 2838 | 2863 | 301.0 | 307.4 |
 
 Multi-turn replay with a warm prefix cache (3 sessions of 3 turns), median of the 9 requests:
 
 | Tier | TTFT vLLM | TTFT this | Decode tok/s vLLM | Decode tok/s this |
 |---|---|---|---|---|
-| 32k | 1.048 s | 0.931 s | 259.0 | 273.2 |
-| 128k | 1.386 s | 1.180 s | 201.1 | 210.0 |
+| 32k | 1.021 s | 0.913 s | 436.4 | 447.1 |
+| 128k | 1.359 s | 1.172 s | 331.0 | 335.7 |
 
-Cached token counts matched vLLM on all 18 requests, and TTFT was lower on all of them.
+Cached token counts matched vLLM on all 18 requests.
 
-Sampling on the host (temperature 0.6, top_p 0.95, top_k 20) decoded at about 261 tok/s, against about 214 for vLLM, measured during the accuracy runs below.
+The sampling path (temperature 0.6, top_p 0.95, top_k 20, no DSpark):
+
+| Tier | Decode tok/s vLLM | Decode tok/s this |
+|---|---|---|
+| 8k | 191.1 | 260.6 |
+| 128k | 150.9 | 189.1 |
+
+### Why the decode median cannot be read alone
+
+`tok/s = τ / R`. R can be compared; the τ of a single stream cannot. A different M rounds differently, a near-tie goes to another token, and all later text and τ change. These prompts are truncated traces with `ignore_eos`, so the model often runs past its natural end into a repetition loop, on vLLM and on the no-draft path as well. An easy loop reaches 1300 tok/s, a hard one 250, and which stream lands in which is a lottery. A policy change that is neutral in replay moved the table above from 1207 to 706 at 1k and from 307 to 493 at 128k.
+
+So 72 further streams were measured (the same prompts minus their first 16·v tokens), separating those whose first 256 tokens have over 0.3 repeated 8-grams:
+
+| Tier | Streams | Mean vLLM → this | Median vLLM → this | Non-loop mean vLLM → this | Loop mean vLLM → this |
+|---|---|---|---|---|---|
+| 1k | 18 | 767 → 614 | 762 → 411 | 438 → 481 | 1031 → 747 |
+| 8k | 18 | 595 → 622 | 489 → 471 | 469 → 499 | 794 → 775 |
+| 32k | 18 | 498 → 557 | 449 → 504 | 417 → 455 | 709 → 760 |
+| 64k | 9 | 407 → 443 | 414 → 439 | 406 → 471 | 408 → 408 |
+| 128k | 9 | 347 → 334 | 301 → 308 | 317 → 334 | 452 → none |
+| All | 72 | 559 → 545 | 456 → 436 | | |
+
+**Overall they tie. The 1k mean and the 8k median are below vLLM, and those gaps come from the loop lottery; non-loop streams are faster at every tier (+5% to +16%).** The policy is chosen by replay, not from these numbers.
 
 ### Correctness
 
+20 random MATH-500 and 20 random GPQA-Diamond problems, thinking on, max_tokens 32768. Same problems throughout, all real long outputs (4,000 to 12,000 tokens on average):
+
+| Path | MATH-500 accuracy | MATH decode tok/s | GPQA accuracy | GPQA decode tok/s | Loops | Truncated |
+|---|---|---|---|---|---|---|
+| This, greedy, DSpark | 95% | 639.5 | 50% | 507.5 | 0 | 0 |
+| vLLM, greedy, DSpark | 90% | 616.0 | 50% | 504.6 | 0 | 2 |
+| This, greedy, no draft | 90% | 293.2 | 50% | 290.5 | 0 | 1 |
+| This, sampling (temperature 0.6) | 95% | 262.8 | 65% | 262.6 | 0 | 0 |
+
 | Check | Result |
 |---|---|
-| MATH-500, 20 random problems | 90% (vLLM 90%), no loops, 1 truncated (vLLM 0) |
-| GPQA-Diamond, 20 random problems | 65% (vLLM 55%), no loops, 2 truncated (vLLM 1) |
-| KL against HF fp32, first generated token, 9 prompts | 0.00001 to 0.098 (vLLM 0.00004 to 0.263). Top-1 matches HF on 9 of 9 (vLLM 8 of 9) |
-| Agreement with HF greedy, 200 tokens on 5 real 1k and 8k traces | 193 to 198 of 200 (vLLM 185 to 193) |
+| Prefix agreement with HF fp32 greedy (repetition_penalty 1.0, 5 prompts of 48 tokens) | 48, 48, 17, 31, 48 of 48 |
 | Tokenizer and chat template, 47 captured samples | Token-for-token identical |
 | Weights, 6 matrices plus embeddings and norms compared with the Python quantizer | Byte-identical |
-| Determinism, prefill and decode | Logits bit-identical across runs |
-| Determinism under preemption, 2000 decode steps while 130 other processes created queues | Bit-identical, no GPU faults. A ROCr process passed the same kind of test |
+| Determinism, prefill and decode kernels | Logits bit-identical across runs |
+| Determinism, DSpark, 15 benchmark requests | First 256 tokens identical across runs |
+| Determinism under preemption, 2000 decode steps while 130 other processes created queues | Bit-identical, no GPU faults (measured before DSpark) |
+
+**GEMV's x is int8.** This is the one place speed was bought with precision: 8% to 17% per round, at a KL about 6 times fp16's (0.0028 vs 0.0004) and 1 to 4 more top-1 flips in 119 positions, all where the top two are close. The fp16 fallback needs scratch memory, which the Go driver does not have.
 
 Read these with some care:
 
-- The accuracy, KL and HF agreement rows were measured just before the final cleanup, and vLLM's before its decode fix. Both newer builds reproduce the first 256 tokens of their earlier selves on all 33 benchmark requests.
-- With 20 problems the sampling error is about ±10 points and the random sequences differ, so the accuracy runs show the absence of a precision collapse, not better accuracy.
-- Greedy output is not token-identical to vLLM. On short prompts two of three matched for all 64 tokens and one split at position 29. On long traces the split comes earlier, at positions that vary.
+- With 20 problems the sampling error is about ±10 points and the random sequences differ, so this shows the absence of a precision collapse, not better accuracy.
+- Greedy output is not token-identical to vLLM, nor to this program's `--no-draft` path. The split position varies, usually within the first 100 tokens.
+- Per-round drafts: for the same prompt and prefix, 60 of 72 aligned rounds had the same M and drafts as vLLM.
 
 ### Not measured
 
 - Agreement with HF above 8k context. The CPU reference is too slow there, so long contexts were only checked by sampling their output.
-- Long-running stability. The longest run was the accuracy suite, about 20 minutes.
+- Determinism under preemption since DSpark was added.
+- Long-running stability. The longest run was one benchmark pass and three accuracy passes in a row, about 1 hour.
 - Any GPU other than this one MI50.
 
 ### Known issue
@@ -265,10 +323,10 @@ sudo build/diag -payload build/payload.bin -mode decode-determinism -n 2000 &
 while [ -n "$(jobs -r)" ]; do sudo build/diag -mode queue-churn; done
 
 # Unit tests. The tokenizer tests need a payload and are skipped without one.
-LFM3_PAYLOAD=build/payload.bin go test ./...
+LFM3_PAYLOAD=$PWD/build/payload.bin go test ./...
 ```
 
-The trace dataset and the MATH and GPQA data are not included in this repository.
+The trace dataset, the MATH and GPQA data and the drafter weights are not included in this repository.
 
 ## License
 

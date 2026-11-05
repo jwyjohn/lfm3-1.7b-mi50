@@ -6,15 +6,17 @@
 
 产物是一个静态 ELF 文件，里面包含量化权重、分词器和全部 GPU 内核，并提供 OpenAI 兼容的 HTTP 接口。运行时不需要 Python、ROCm 或 libc，只需要内核自带的 amdgpu/KFD 驱动。
 
-它用来替代同一张卡上同一模型的 vLLM 部署，在所有测过的上下文长度上都更快：
+它用来替代同一张卡上同一模型的 vLLM 部署，两边使用相同的 DSpark kernel 和策略：
 
-| 上下文 | TTFT，vLLM → 本项目 | decode tok/s，vLLM → 本项目 |
+| 上下文 | TTFT，vLLM → 本项目 | greedy decode tok/s，vLLM → 本项目 |
 |---|---|---|
-| 1k | 0.211 → 0.126 s | 286.4 → 302.2 |
-| 32k | 5.984 → 5.798 s | 257.0 → 270.1 |
-| 128k | 46.506 → 45.982 s | 200.5 → 208.1 |
+| 1k | 0.201 → 0.126 s | 974 → 1207 |
+| 32k | 5.829 → 5.678 s | 364 → 613 |
+| 128k | 44.738 → 44.343 s | 301 → 307 |
 
-测试方法、完整数据和没有测的部分见[评测](#评测)。
+TTFT、prefill、热启动和采样路径在每一档都更好。上表的 decode 是 3 条流的中位数，**受混沌影响很大，不能单独看**：72 条流的总体基本打平（均值 559 → 545），把落入重复循环的流分开后，正常文本每一档快 5% 到 16%。详见[评测](#评测)，优化全过程见[优化报告](docs/OPTIMIZATION_REPORT.md)。
+
+只有 `temperature: 0` 的请求走 DSpark。模型默认的 temperature 是 0.1，走采样路径，约 260 tok/s。这和 vLLM 行为一致。
 
 ## 快速开始
 
@@ -26,15 +28,15 @@ for f in config.json tokenizer.json model.safetensors; do
   curl -L -o "model/$f" "https://huggingface.co/LiquidAI/LFM3-1.7B/resolve/$rev/$f"
 done
 
-# 2. 构建 dist/lfm3-1.7b-mi50（约 2.3 GB）
-./build.sh model
+# 2. 构建 dist/lfm3-1.7b-mi50（约 2 GB）。drafter 目录见"模型权重"
+./build.sh model drafter
 
 # 3. 运行。访问 /dev/kfd 需要 root 或 render 组
 sudo ./dist/lfm3-1.7b-mi50 --port 18000
 
 # 4. 调用
 curl localhost:18000/v1/chat/completions \
-  -d '{"messages":[{"role":"user","content":"What is 2+2? Reply briefly."}]}'
+  -d '{"messages":[{"role":"user","content":"What is 2+2? Reply briefly."}],"temperature":0}'
 ```
 
 可执行文件是自包含的，可以直接复制到另一台装有同样显卡的机器上运行。
@@ -48,16 +50,16 @@ curl localhost:18000/v1/chat/completions \
 | GPU | AMD Radeon Instinct MI50 32 GB（gfx906） | 唯一支持的设备，启动时检查 KFD 拓扑 |
 | 内核 | Linux 7.2.11（Debian），内核自带 amdgpu | KFD ioctl ABI 1.x |
 | 权限 | root | 或者加入 `/dev/kfd` 所属的组（未测试） |
-| 空闲显存 | 32 GB，卡上没有其他任务 | 默认 131072 token 上限时至少需要约 5.5 GB，不足时拒绝启动 |
+| 空闲显存 | 32 GB，卡上没有其他任务 | 默认 131072 token 上限时至少需要约 7 GB，不足时拒绝启动 |
 | CPU | Intel i5-1340P | 处理请求时有一个核心在自旋 |
-| 内存 | 16 GB | 权重通过页缓存读取 |
+| 内存 | 16 GB | 启动时峰值约 7.3 GB（含文件映射），运行时约 1.8 GB |
 
 **构建**
 
 | | 版本 | 说明 |
 |---|---|---|
 | Go | 1.27（测试用 1.27.3） | 无第三方模块，`CGO_ENABLED=0` |
-| 模型文件 | 见下文 | 打包时内存峰值约 8 GB（含文件映射），16 线程约 13 秒 |
+| 模型文件 | 见下文 | 打包时内存峰值约 8 GB（含文件映射），16 线程约 10 秒 |
 
 **修改 GPU 内核**（只有这时才需要）
 
@@ -86,6 +88,15 @@ hf download LiquidAI/LFM3-1.7B model.safetensors config.json tokenizer.json \
 
 `cmd/pack` 在构建时量化一次权重。输出可以逐字节复现，且在所有比对过的矩阵上都与原 Python 量化实现一致。
 
+DSpark drafter 的权重也不在本仓库里，目前没有公开发布，代码验证时用的是训练中途的检查点 `lfm3-1.7b-dspark-l4b44-step10260`：
+
+| 文件 | 大小（字节） | SHA-256 |
+|---|---|---|
+| `model.safetensors` | 519113708 | `7a1e6d24a916b0814fd106b6194cdcd309eec7919f013d89798896d84efbdf0f` |
+| `config.json` | 1855 | `930d3e014c73ec67f2fa66e782997dc779e2a0bd5195e5c508f76a69b0e8fc37` |
+
+head 裁剪用的 16384 个高频 token 已提交在 `cmd/pack/crop_ids.bin`。换权重只需要 `./build.sh model <新目录>`（先删除 `build/payload.bin`），但策略要重新回放。
+
 权重采用 LFM Open License v1.0，对超过一定收入门槛的商业使用有限制。构建出的可执行文件包含由权重派生的数据，分发前请先阅读该许可证。
 
 ## 技术路线与理由
@@ -106,24 +117,37 @@ hf download LiquidAI/LFM3-1.7B model.safetensors config.json tokenizer.json \
 
 Go 无法编译到 GPU，现有内核又经过大量调优，所以继续用 HIP C++，以 gfx906 code object 的形式通过 `go:embed` 嵌入：
 
-- `decode.hip`：decode megakernel。一次持久 launch 跑完 24 层、LM head 和 greedy 采样。
+- `dspark.hip`：DSpark megakernel。一次 launch 在 GPU 上完成 draft、verify 和 commit，最多 32 轮。greedy 请求走这里。
+- `decode.hip`：decode megakernel。一次持久 launch 跑完 24 层和 LM head，一次一个 token。采样、logprobs 和 `min_tokens` 的请求走这里。
 - `prefill_attn.hip`：基于分页 int8 KV cache 的 flash attention。
 - `gemm.hip`：prefill 所有线性层的 W8A8 矩阵乘法。
 - `ops.hip`：新写的。原生实现 vLLM 里走 torch 或 Triton JIT 的算子：embedding、RMS norm、因果卷积、Q/K norm 与 RoPE、int8 KV 写入、gate、fp16 LM head。
 
-运行时不做任何编译。模型启动约 5 秒就绪，vLLM 部署约需 38 秒。
+运行时不做任何编译。模型启动约 7.5 秒就绪，vLLM 部署约需 22 秒。
 
-编译好的内核（约 170 KB）提交在仓库里，这样只用 Go 工具链就能构建项目。
+编译好的内核（约 420 KB）提交在仓库里，这样只用 Go 工具链就能构建项目。
+
+Go 驱动没有 scratch 内存，所以 `dspark.hip` 必须用 `-mllvm -disable-machine-licm` 编译，并保持 `private_segment_fixed_size` 为 0。
+
+### DSpark 写进 megakernel
+
+decode 的钱主要花在读权重上，一次验证 M 个 token 也只读一遍：8k 上 M=1 每轮 3.73 ms，M≈4 只要 4.06 ms。所以让 3 层的 drafter 先猜，再一次验证，`tok/s = τ / R`。draft 和 verify 每秒交替 200 多次，回 CPU 太贵，全部写在一个 kernel 里，CPU 只把提交的 token 发出去。被拒的 token 不需要回滚：卷积历史放在按位置索引的环里，K/V 写在临时页，提交时才拷进 KV cache。
+
+和 vLLM 版本相比多了一点：verify 可以越过 32 token 的 block 边界，边界处的卷积状态由 kernel 从历史环里写一份。回放增益 0.6% 到 1.3%。
+
+策略（8k 以下最多 7 个 draft、32768 以上最多 3 个、置信度阈值 −0.4）由固定序列回放选出，不是看基准数字选的，原因见[评测](#评测)。
 
 ### 把权重附加在 ELF 之后
 
-模型数据约 2.3 GB，而 Go 链接器把数据段限制在约 2 GB，所以不能用 `go:embed`。`cmd/pack` 把数据附加到构建好的可执行文件末尾，并写入一个定位用的 footer，程序启动时以只读方式映射自身文件。
+模型数据约 1.9 GB，而 Go 链接器把数据段限制在约 2 GB，留给程序的余量太小，所以不用 `go:embed`。`cmd/pack` 把数据附加到构建好的可执行文件末尾，并写入一个定位用的 footer，程序启动时以只读方式映射自身文件。
 
-这样不需要解压到磁盘。需要注意的是 `strip` 这类工具会丢掉这些数据，所以 `build.sh` 在附加数据之前就先去掉了 Go 二进制的符号。
+权重分块做熵编码（标准库的 Huffman），启动时并行解码到内存，不写磁盘。需要注意的是 `strip` 这类工具会丢掉这些数据，所以 `build.sh` 在附加数据之前就先去掉了 Go 二进制的符号。
 
 ### 只存一种权重布局，另一种现算
 
 decode 和 prefill 用的是相同的 int8 数值，只是布局不同。这里只存 decode 布局，prefill 布局在启动时生成，这样可执行文件能少约 1.5 GB。
+
+同样不存的还有 LM head（就是量化后的 embedding，260 MB）、drafter 的 head 裁剪和 k/v 投影（量化是逐行独立的，直接抄已有的行）。熵编码对 int8 权重只省 7%，因为它们接近随机噪声；对 embedding 省 34%，因为 BF16 转 fp16 后低 3 位全是 0。结果是多装了一个 drafter，文件反而从 2.3 GB 降到 1.97 GB。
 
 ### 为单流设计的前缀缓存
 
@@ -135,7 +159,7 @@ full attention 的 KV 块按 LRU 淘汰。sliding attention 块和卷积检查�
 
 ### 没有实现的内容
 
-范围只包括这张卡上的单流推理。结构化输出（需要语法引擎）、speculation、多模态输入和批处理都没有实现。
+范围只包括这张卡上的单流推理。结构化输出（需要语法引擎）、多模态输入和批处理都没有实现。
 
 ## 必须保证正确的几点
 
@@ -170,17 +194,18 @@ full attention 的 KV 块按 LRU 淘汰。sliding attention 块和卷积检查�
 | `--gpu-memory-utilization` | `0.90` | 可用的显存比例，KV 池占用余下部分 |
 | `--kv-tokens` | 按显存计算 | full attention KV 容量（token） |
 | `--payload` | 可执行文件本身 | 从单独的 payload 文件读取模型（开发用） |
+| `--no-draft` | 关 | greedy 请求不走 DSpark，用于对比 |
 
 ## 项目结构
 
 ```
 build.sh           构建 dist/lfm3-1.7b-mi50
 cmd/lfm3-1.7b-mi50      服务主程序
-cmd/pack           量化权重、编译分词器、附加 payload（构建时用）
+cmd/pack           量化权重和 drafter、编译分词器、附加 payload（构建时用）
 cmd/bench          测评客户端，可用于任何 OpenAI 兼容服务
 cmd/diag           GPU 检查：各路径的确定性、内核时间与端到端时间
 internal/kfd       纯 Go 的 KFD 驱动：ioctl、显存、AQL 队列、code object 加载
-internal/model     权重布局、prefill 流水线、decode、前缀缓存、生成循环
+internal/model     权重布局、prefill 流水线、decode、DSpark、前缀缓存、生成循环
 internal/sample    采样器，操作顺序与 vLLM 相同
 internal/tokenizer BPE 分词器
 internal/chat      手工翻译的 chat template
@@ -188,58 +213,91 @@ internal/server    HTTP 接口、reasoning 与工具调用解析
 kernels/           GPU 内核：.hip 源码和编译好的 gfx906 code object
 testdata/          从参考部署抓取的分词、模板和接口样例
 benchmarks/        测评原始输出
+docs/              优化报告
 ```
 
 ## 评测
 
-**环境。** MI50 32 GB（gfx906，60 CU），Intel i5-1340P，16 GB 内存，Linux 7.2.11。基线是 vLLM（ROCm 7.2.4），使用相同的模型和定制内核（包含下文的 decode 修复）、int8 KV cache，关闭 speculation。每次测试都独占 GPU。所有数字都是 `cmd/bench` 测得的绝对值，没有在负载下做相对比较。
+**环境。** MI50 32 GB（gfx906，60 CU），Intel i5-1340P，16 GB 内存，Linux 7.2.11。基线是 vLLM（ROCm 7.2.4），使用相同的模型、相同的 DSpark kernel、权重 step 10260 和相同的策略。每次测试都独占 GPU。所有数字都是 `cmd/bench` 测得的绝对值，原始输出在 `benchmarks/`。
 
 ### 性能
 
-单流、流式响应、输出 1024 token、冷缓存。请求来自 Open-SWE-Traces 的真实 agent 轨迹，以 token id 发送。每个数值取 3 个会话的中位数，原始输出在 `benchmarks/`。
+单流、流式响应、输出 1024 token、冷缓存、temperature 0。请求来自 Open-SWE-Traces 的真实 agent 轨迹，以 token id 发送。每个数值取 3 个会话的中位数。
 
 | 上下文 | 输入 token | TTFT vLLM | TTFT 本项目 | prefill tok/s vLLM | prefill tok/s 本项目 | decode tok/s vLLM | decode tok/s 本项目 |
 |---|---|---|---|---|---|---|---|
-| 1k | 1024 | 0.211 s | 0.126 s | 4859 | 8138 | 286.4 | 302.2 |
-| 8k | 8192 | 1.158 s | 1.049 s | 7074 | 7812 | 278.8 | 293.2 |
-| 32k | 32768 | 5.984 s | 5.798 s | 5476 | 5651 | 257.0 | 270.1 |
-| 64k | 65536 | 16.125 s | 15.806 s | 4064 | 4146 | 233.7 | 244.9 |
-| 128k | 126976 | 46.506 s | 45.982 s | 2730 | 2761 | 200.5 | 208.1 |
+| 1k | 1024 | 0.201 s | 0.126 s | 5090 | 8135 | 974.2 | 1206.8 |
+| 8k | 8192 | 1.157 s | 1.044 s | 7082 | 7843 | 532.3 | 954.4 |
+| 32k | 32768 | 5.829 s | 5.678 s | 5622 | 5771 | 363.5 | 612.7 |
+| 64k | 65536 | 15.574 s | 15.371 s | 4208 | 4264 | 412.8 | 449.6 |
+| 128k | 126976 | 44.738 s | 44.343 s | 2838 | 2863 | 301.0 | 307.4 |
 
 多轮对话回放，前缀缓存已预热（3 个会话，每个 3 轮），取 9 个请求的中位数：
 
 | 档位 | TTFT vLLM | TTFT 本项目 | decode tok/s vLLM | decode tok/s 本项目 |
 |---|---|---|---|---|
-| 32k | 1.048 s | 0.931 s | 259.0 | 273.2 |
-| 128k | 1.386 s | 1.180 s | 201.1 | 210.0 |
+| 32k | 1.021 s | 0.913 s | 436.4 | 447.1 |
+| 128k | 1.359 s | 1.172 s | 331.0 | 335.7 |
 
-18 个请求的命中 token 数都和 vLLM 相同，TTFT 也全部更低。
+18 个请求的命中 token 数都和 vLLM 相同。
 
-在主机上采样（temperature 0.6、top_p 0.95、top_k 20）时 decode 约 261 tok/s，vLLM 约 214 tok/s，数据来自下面的正确性评测。
+采样路径（temperature 0.6、top_p 0.95、top_k 20，不走 DSpark）：
+
+| 档位 | decode tok/s vLLM | decode tok/s 本项目 |
+|---|---|---|
+| 8k | 191.1 | 260.6 |
+| 128k | 150.9 | 189.1 |
+
+### 为什么 decode 的中位数不能单独看
+
+`tok/s = τ / R`。R 可以比，单条流的 τ 不能比：M 不同，浮点取整就不同，近似打平的位置换一个 token，后面的文本和 τ 就全变了。这些 prompt 是截断的轨迹，又带 `ignore_eos`，模型跑过自然结束点后常常掉进循环，这在 vLLM 和无 draft 路径上都有。好猜的循环能到 1300 tok/s，难猜的只有 250，哪条流掉进哪种循环就是抽签。一条回放里基本中性的策略改动，能把上表 1k 从 1207 变成 706，128k 从 307 变成 493。
+
+所以另外测了 72 条流（同样的 prompt 去掉开头 16·v 个 token），把前 256 个 token 中重复 8-gram 比例超过 0.3 的流分开：
+
+| 档位 | 流数 | 均值 vLLM → 本项目 | 中位数 vLLM → 本项目 | 非循环流均值 vLLM → 本项目 | 循环流均值 vLLM → 本项目 |
+|---|---|---|---|---|---|
+| 1k | 18 | 767 → 614 | 762 → 411 | 438 → 481 | 1031 → 747 |
+| 8k | 18 | 595 → 622 | 489 → 471 | 469 → 499 | 794 → 775 |
+| 32k | 18 | 498 → 557 | 449 → 504 | 417 → 455 | 709 → 760 |
+| 64k | 9 | 407 → 443 | 414 → 439 | 406 → 471 | 408 → 408 |
+| 128k | 9 | 347 → 334 | 301 → 308 | 317 → 334 | 452 → 无 |
+| 全部 | 72 | 559 → 545 | 456 → 436 | | |
+
+**总体打平，1k 的均值和 8k 的中位数低于 vLLM，这些差异都来自循环流的抽签；非循环流每一档都更快（+5% 到 +16%）。** 策略用固定序列回放选，不用这些数字选。
 
 ### 正确性
 
+MATH-500 和 GPQA-Diamond 各随机 20 题，thinking 开启，max_tokens 32768。题目相同，都是真实的长输出（平均 4000 到 12000 token）：
+
+| 路径 | MATH-500 正确率 | MATH decode tok/s | GPQA 正确率 | GPQA decode tok/s | 循环 | 截断 |
+|---|---|---|---|---|---|---|
+| 本项目，greedy，DSpark | 95% | 639.5 | 50% | 507.5 | 0 | 0 |
+| vLLM，greedy，DSpark | 90% | 616.0 | 50% | 504.6 | 0 | 2 |
+| 本项目，greedy，不用 draft | 90% | 293.2 | 50% | 290.5 | 0 | 1 |
+| 本项目，采样（temperature 0.6） | 95% | 262.8 | 65% | 262.6 | 0 | 0 |
+
 | 检查项 | 结果 |
 |---|---|
-| MATH-500，随机 20 题 | 90%（vLLM 90%），无循环，1 题截断（vLLM 0） |
-| GPQA-Diamond，随机 20 题 | 65%（vLLM 55%），无循环，2 题截断（vLLM 1） |
-| 首个生成 token 对 HF fp32 的 KL，9 个 prompt | 0.00001 到 0.098（vLLM 0.00004 到 0.263）。top-1 与 HF 一致 9/9（vLLM 8/9） |
-| 与 HF greedy 的一致度，5 条 1k 和 8k 真实轨迹各 200 token | 193 到 198/200（vLLM 185 到 193） |
+| 与 HF fp32 greedy 的前缀一致（repetition_penalty 1.0，5 个提示各 48 token） | 48、48、17、31、48 / 48 |
 | 分词器和 chat template，47 组抓取样例 | 逐 token 一致 |
 | 权重，6 个矩阵及 embedding、norm 与 Python 量化实现比对 | 逐字节一致 |
-| 确定性，prefill 和 decode | 多次运行 logits 逐位相同 |
-| 抢占下的确定性，2000 步 decode，其间 130 个其他进程创建队列 | 逐位相同，无 GPU 故障。ROCr 进程通过了同类测试 |
+| 确定性，prefill 和 decode 内核 | 多次运行 logits 逐位相同 |
+| 确定性，DSpark，15 个评测请求 | 不同运行的前 256 个 token 全部相同 |
+| 抢占下的确定性，2000 步 decode，其间 130 个其他进程创建队列 | 逐位相同，无 GPU 故障（测于接入 DSpark 之前） |
+
+**GEMV 的 x 是 int8。** 这是唯一一处用精度换速度的决定：每轮快 8% 到 17%，代价是 KL 约为 fp16 的 6 倍（0.0028 vs 0.0004），top-1 在 119 个位置上多翻转 1 到 4 处，都发生在第一名和第二名接近的位置。fp16 回退路径需要 scratch 内存，Go 驱动没有。
 
 解读时需要注意：
 
-- 准确率、KL 和 HF 一致度这几行是在最后一轮清理之前测的，vLLM 的数据则测于 decode 修复之前。两边的新版本在全部 33 个测评请求上都复现了旧版本的前 256 个 token。
 - 20 题的抽样误差约 ±10 个百分点，随机数序列也不同，所以这只能说明没有精度崩坏，不能说明更准。
-- greedy 输出和 vLLM 并非逐 token 相同。短提示上三个有两个 64 个 token 全部一致，另一个在第 29 位分叉；长轨迹上分叉更早，位置也不固定。
+- greedy 输出和 vLLM 并非逐 token 相同，和本项目的 `--no-draft` 路径也不相同。分叉的位置不固定，通常在前 100 个 token 内。
+- 逐轮比较 draft：同一 prompt、同一前缀，72 个对齐轮次中 60 个的 M 和 draft 与 vLLM 完全相同。
 
 ### 没有测的部分
 
 - 8k 以上上下文与 HF 的一致度。CPU 基准在这个长度上太慢，长上下文只抽查了输出。
-- 长时间运行的稳定性。最长的一次是正确性评测，约 20 分钟。
+- 接入 DSpark 之后，抢占下的确定性。
+- 长时间运行的稳定性。最长的一次是连续跑完一轮基准和三轮正确性评测，约 1 小时。
 - 这张 MI50 之外的任何 GPU。
 
 ### 已知问题
@@ -265,10 +323,10 @@ sudo build/diag -payload build/payload.bin -mode decode-determinism -n 2000 &
 while [ -n "$(jobs -r)" ]; do sudo build/diag -mode queue-churn; done
 
 # 单元测试。分词器相关测试需要 payload，没有时会跳过
-LFM3_PAYLOAD=build/payload.bin go test ./...
+LFM3_PAYLOAD=$PWD/build/payload.bin go test ./...
 ```
 
-本仓库不包含轨迹数据集和 MATH、GPQA 数据。
+本仓库不包含轨迹数据集、MATH、GPQA 数据和 drafter 权重。
 
 ## 许可证
 

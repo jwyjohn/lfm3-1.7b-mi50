@@ -1,0 +1,9 @@
+case                            input    TTFT s prefill t/s  decode t/s
+  single-t8192-o1024-claudecode     8192     1.215        6741       189.8  out=1024 cached=0
+  single-t8192-o1024-openhands     8192     1.155        7090       191.1  out=1024 cached=0
+  single-t8192-o1024-minisweagent     8192     1.157        7081       191.4  out=1024 cached=0
+single-t8192-o1024               8192     1.157        7081       191.1
+  single-t128000-o1024-claudecode   126976    44.676        2842       150.9  out=1024 cached=0
+  single-t128000-o1024-openhands   126976    44.733        2839       150.8  out=1024 cached=0
+  single-t128000-o1024-minisweagent   126976    44.694        2841       151.2  out=1024 cached=0
+single-t128000-o1024           126976    44.694        2841       150.9
