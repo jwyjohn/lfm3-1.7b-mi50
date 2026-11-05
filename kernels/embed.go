@@ -7,6 +7,9 @@ import _ "embed"
 //go:embed decode.co
 var Decode []byte
 
+//go:embed dspark.co
+var DSpark []byte
+
 //go:embed prefill_attn.co
 var PrefillAttn []byte
 

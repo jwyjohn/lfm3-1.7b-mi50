@@ -41,6 +41,9 @@ type Result struct {
 	StopToken    int32
 	PrefillTime  time.Duration
 	DecodeTime   time.Duration
+
+	// DSpark rounds of this request: drafts accepted and tokens verified over them.
+	Rounds, Accepted, Verified int
 }
 
 // sequence tracks the active request's blocks.
@@ -53,6 +56,8 @@ type sequence struct {
 	full       []int32 // logical -> physical
 	slide      []int32
 	slideEpoch []int64
+
+	longContext bool // decode started deep in the context: fewer drafts per round
 }
 
 // Generate runs one request to completion. Single stream: callers must serialize.
@@ -74,6 +79,17 @@ func (e *Engine) Generate(req *Request, emit func(Step) bool) (*Result, error) {
 	computed := e.reuse(seq, req.Prompt)
 	res.CachedTokens = computed
 
+	kernelSamples := req.Params.Greedy() && req.Logprobs < 0 && len(req.Params.LogitBias) == 0 &&
+		len(req.Params.AllowedTokens) == 0 && req.Params.FrequencyPenalty == 0 && req.Params.PresencePenalty == 0
+	// A stop-token mask until MinTokens needs the logits on the host, every token. With
+	// IgnoreEOS nothing stops generation, so there is nothing to hold back.
+	speculate := kernelSamples && (req.MinTokens == 0 || req.IgnoreEOS) && !e.cfg.NoDraft && e.cfg.Layout == LayoutBoth
+	tapFirst := len(req.Prompt)
+	e.ds.tapFrom = -1
+	if speculate {
+		tapFirst = max(computed, len(req.Prompt)-e.ds.window)
+		e.ds.tapFrom = tapFirst
+	}
 	if err := e.prefill(seq, computed, len(req.Prompt)); err != nil {
 		return nil, err
 	}
@@ -89,31 +105,63 @@ func (e *Engine) Generate(req *Request, emit func(Step) bool) (*Result, error) {
 	e.InitSeen(req.Prompt, req.Params.RepetitionPenalty)
 	scratch := make([]float32, Vocab)
 
-	kernelSamples := req.Params.Greedy() && req.Logprobs < 0 && len(req.Params.LogitBias) == 0 &&
-		len(req.Params.AllowedTokens) == 0 && req.Params.FrequencyPenalty == 0 && req.Params.PresencePenalty == 0
+	// deliver hands one token to the caller and reports whether generation goes on.
+	deliver := func(tok int32, step Step) bool {
+		st.Observe(tok)
+		seq.tokens = append(seq.tokens, tok)
+		res.Output++
+		stop := !req.IgnoreEOS && res.Output > req.MinTokens && req.StopTokens[tok]
+		if !emit(step) {
+			return false
+		}
+		if stop {
+			res.Stopped, res.StopToken = true, tok
+			return false
+		}
+		return res.Output < req.MaxTokens
+	}
 
 	next, step := e.hostSample(req, st, scratch, rng, 0)
 	decodeStart := time.Now()
-	for {
-		st.Observe(next)
-		seq.tokens = append(seq.tokens, next)
-		res.Output++
-		stop := !req.IgnoreEOS && res.Output > req.MinTokens && req.StopTokens[next]
-		if !emit(step) {
-			break
-		}
-		if stop {
-			res.Stopped, res.StopToken = true, next
-			break
-		}
-		if res.Output >= req.MaxTokens {
-			break
-		}
-		// next is not yet in the KV cache: this step computes it and predicts the next.
+	draftReady := false
+	for more := deliver(next, step); more; {
+		// The last token is not yet in the KV cache: this step computes it and predicts the next.
 		pos := len(seq.tokens) - 1
 		if err := e.ensureBlock(seq, pos/BlockTokens); err != nil {
 			return nil, err
 		}
+		if speculate {
+			if !draftReady {
+				draftReady = true
+				seq.longContext = pos >= dsLongFrom
+				if err := e.beginDraft(seq, tapFirst, len(req.Prompt)); err != nil {
+					return nil, err
+				}
+			}
+			eos := int32(-1)
+			if !req.IgnoreEOS && req.StopTokens[EOS] {
+				eos = EOS
+			}
+			out, err := e.draftLaunch(seq, req.MaxTokens-res.Output, eos, req.Params.RepetitionPenalty)
+			if err != nil {
+				return nil, err
+			}
+			res.Rounds += out.rounds
+			res.Accepted += out.accepted
+			res.Verified += out.verified
+			delivered := 0
+			for _, t := range out.tokens {
+				delivered++
+				if more = deliver(t, Step{Token: t}); !more {
+					break
+				}
+			}
+			if delivered == len(out.tokens) && pos+delivered >= out.boundary && out.boundary%BlockTokens == 0 {
+				e.registerAt(seq, out.boundary, out.convEpoch)
+			}
+			continue
+		}
+		next = seq.tokens[pos]
 		slotFull := int64(seq.full[pos/BlockTokens])*BlockTokens + int64(pos%BlockTokens)
 		slotSlide := int64(seq.slide[pos/BlockTokens])*BlockTokens + int64(pos%BlockTokens)
 		minActive := res.Output < req.MinTokens
@@ -132,6 +180,7 @@ func (e *Engine) Generate(req *Request, emit func(Step) bool) (*Result, error) {
 		if (pos+1)%BlockTokens == 0 {
 			e.register(seq, pos+1)
 		}
+		more = deliver(next, step)
 	}
 	res.DecodeTime = time.Since(decodeStart)
 	return res, e.drain(kfd.ScopeAgent)
@@ -242,11 +291,15 @@ func (e *Engine) ensureBlock(seq *sequence, logical int) error {
 	return nil
 }
 
-// prefill computes tokens [from, to). Chunks end on 2048-token boundaries so the conv
-// state of each chunk end can be checkpointed, as vLLM's "align" cache mode does.
+// prefill computes tokens [from, to). Chunks end on block boundaries so the conv state of
+// each chunk end can be checkpointed, as vLLM's "align" cache mode does.
 func (e *Engine) prefill(seq *sequence, from, to int) error {
+	chunk := shortChunk
+	if to >= longChunkFrom {
+		chunk = maxChunk
+	}
 	for start := from; start < to; {
-		end := start + maxChunk
+		end := start + chunk
 		if end > to {
 			end = to
 		}

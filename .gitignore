@@ -1,4 +1,4 @@
-# Build outputs. dist/lfm3-1.7b-mi50 is about 2.3 GB and embeds the model weights.
+# Build outputs. dist/lfm3-1.7b-mi50 is about 2 GB and embeds the model weights.
 /build/
 /dist/
 

@@ -18,7 +18,12 @@ const (
 	halfPacks   = 16
 	qrowDwords  = D/4 + 4
 	mixColumns  = 3088
-	maxChunk    = 2048
+	// maxChunk serves prompts from longChunkFrom tokens on: at 7680 tokens a chunk maps to
+	// 1920 attention tiles, whole rounds of the 60 CUs, and each layer's fixed costs spread
+	// over more tokens. Short prompts stay at shortChunk, which ends sooner.
+	maxChunk      = 7680
+	shortChunk    = 2048
+	longChunkFrom = 32768
 )
 
 // g128Weight is one linear layer in the GEMM kernel's packed layout.
@@ -168,53 +173,73 @@ func fillPacked(dst, biased []byte, m matrixSpec) {
 	})
 }
 
-// fillScales writes fp32 [K/128][rows padded to the tile], padding scale 1.
+// fillScales writes fp32 [K/128][rows padded to the tile] from the decode layout's scales.
 func fillScales(dst, packedScales []byte, m matrixSpec) {
-	tiles := (m.rows + gemmTile - 1) / gemmTile
-	padded := tiles * gemmTile
-	groups := m.k / weights.Group
 	sq := weights.SQ(m.k)
 	srow := 4 * sq
+	fillGroupScales(dst, m.rows, m.k/weights.Group, func(r, g int) uint16 {
+		at := (m.rowMap(r)*srow + (g%4)*sq + g/4) * 2
+		return binary.LittleEndian.Uint16(packedScales[at:])
+	})
+}
+
+// fillGroupScales writes fp32 [groups][rows padded to the tile], padding scale 1.
+func fillGroupScales(dst []byte, rows, groups int, scale func(r, g int) uint16) {
+	tiles := (rows + gemmTile - 1) / gemmTile
+	padded := tiles * gemmTile
 	weights.Parallel(groups, func(g int) {
 		col := make([]uint32, padded)
 		for r := range col {
 			col[r] = 0x3f800000 // 1.0
 		}
-		quarter, i := g%4, g/4
-		for r := 0; r < m.rows; r++ {
-			at := (m.rowMap(r)*srow + quarter*sq + i) * 2
-			col[r] = math.Float32bits(fp16.ToFloat32(binary.LittleEndian.Uint16(packedScales[at:])))
+		for r := 0; r < rows; r++ {
+			col[r] = math.Float32bits(fp16.ToFloat32(scale(r, g)))
 		}
 		raw := unsafe.Slice((*byte)(unsafe.Pointer(&col[0])), padded*4)
 		copy(dst[g*padded*4:], raw)
 	})
 }
 
+// chunkSizes lists the chunk tensors, for allocation and for the VRAM budget.
+func (p *prefillBuffers) chunkSizes() map[**kfd.Buffer]uint64 {
+	const fp16Bytes = 2
+	return map[**kfd.Buffer]uint64{
+		&p.ids:     maxChunk * 4,
+		&p.h:       maxChunk * H * fp16Bytes,
+		&p.n:       maxChunk * H * fp16Bytes,
+		&p.f:       maxChunk * mixColumns * fp16Bytes,
+		&p.bcx:     maxChunk * 3 * H * fp16Bytes,
+		&p.bxs:     (maxChunk + ConvState) * H * fp16Bytes,
+		&p.y:       maxChunk * H * fp16Bytes,
+		&p.o:       maxChunk * H * fp16Bytes,
+		&p.a:       maxChunk * H * fp16Bytes,
+		&p.q:       maxChunk * H * fp16Bytes,
+		&p.gu:      maxChunk * 2 * I * fp16Bytes,
+		&p.d:       maxChunk * H * fp16Bytes,
+		&p.aPacked: maxChunk * I,
+		&p.aScales: maxChunk * I / weights.Group * 4,
+		&p.qbuf:    maxChunk * QH * qrowDwords * 4,
+	}
+}
+
+// chunkBufferBytes is the VRAM of the chunk tensors, rounded as the allocator does.
+func chunkBufferBytes() uint64 {
+	var total uint64
+	var p prefillBuffers
+	for _, size := range p.chunkSizes() {
+		total += (size + 2<<20 - 1) &^ (2<<20 - 1)
+	}
+	return total
+}
+
 func (e *Engine) allocPrefillBuffers() error {
 	var err error
-	a := func(dst **kfd.Buffer, size uint64) {
-		if err != nil {
-			return
+	for dst, size := range e.pf.chunkSizes() {
+		if err == nil {
+			*dst, err = e.dev.Alloc(size, kfd.VRAM)
 		}
-		*dst, err = e.dev.Alloc(size, kfd.VRAM)
 	}
 	p := &e.pf
-	const fp16Bytes = 2
-	a(&p.ids, maxChunk*4)
-	a(&p.h, maxChunk*H*fp16Bytes)
-	a(&p.n, maxChunk*H*fp16Bytes)
-	a(&p.f, maxChunk*mixColumns*fp16Bytes)
-	a(&p.bcx, maxChunk*3*H*fp16Bytes)
-	a(&p.bxs, (maxChunk+ConvState)*H*fp16Bytes)
-	a(&p.y, maxChunk*H*fp16Bytes)
-	a(&p.o, maxChunk*H*fp16Bytes)
-	a(&p.a, maxChunk*H*fp16Bytes)
-	a(&p.q, maxChunk*H*fp16Bytes)
-	a(&p.gu, maxChunk*2*I*fp16Bytes)
-	a(&p.d, maxChunk*H*fp16Bytes)
-	a(&p.aPacked, maxChunk*I)
-	a(&p.aScales, maxChunk*I/weights.Group*4)
-	a(&p.qbuf, maxChunk*QH*qrowDwords*4)
 	if err != nil {
 		return fmt.Errorf("prefill buffers: %w", err)
 	}
@@ -465,6 +490,9 @@ func (e *Engine) PrefillChunk(ids []int32, context int, convSlot int32, hasIniti
 			next, n uint64
 		}{p.d.VA, H, arena("post_ffn_norm"), h, next, n}
 		e.launch(o.postAddNorm, rows, 1, 256, unsafe.Pointer(&pf), 48)
+		if slot := tapSlot(li); slot >= 0 && e.ds.tapFrom >= 0 {
+			e.captureTap(slot, h, context, T)
+		}
 		if err := e.drain(kfd.ScopeAgent); err != nil {
 			return fmt.Errorf("prefill layer %d: %w", li, err)
 		}

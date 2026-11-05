@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"runtime/debug"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -107,6 +108,9 @@ type Config struct {
 	// beside another GPU process. Generate needs LayoutBoth.
 	Layout Layout
 
+	// NoDraft keeps greedy requests on the one-token decode kernel.
+	NoDraft bool
+
 	// Zero values pick defaults sized for MaxContext and VRAMFraction.
 	FullTokens  int // KV capacity of full-attention layers, tokens
 	SlideBlocks int // ring of KV blocks for sliding-attention layers
@@ -149,6 +153,9 @@ type Engine struct {
 	arena *kfd.Buffer
 	embed *kfd.Buffer
 
+	headBuf *kfd.Buffer
+	ds      draftState
+
 	prefillArena *kfd.Buffer
 	pfLayers     [Layers]prefillLayer
 	pf           prefillBuffers
@@ -188,20 +195,23 @@ func Open(cfg Config, pay *payload.Payload) (*Engine, error) {
 		return nil, err
 	}
 	e := &Engine{cfg: cfg, dev: dev, q: q, signal: q.NewSignal()}
+	e.ds.tapFrom = -1 // no prefill captures until a request asks for it
 	if err := e.checkFootprint(pay); err != nil {
 		return nil, err
 	}
 	if err := e.loadKernels(); err != nil {
 		return nil, err
 	}
-	if err := e.loadWeights(pay); err != nil {
+	head, err := e.loadWeights(pay)
+	if err != nil {
 		return nil, err
 	}
 	if err := e.allocRuntime(); err != nil {
 		return nil, err
 	}
+	var targetRows []uint64
 	if cfg.Layout != LayoutPrefillOnly {
-		e.buildLayers()
+		targetRows = e.buildLayers()
 	}
 	e.cache = newPrefixCache(e.fullBlocks, e.cfg.SlideBlocks, e.cfg.ConvSlots)
 	if cfg.Layout != LayoutDecodeOnly {
@@ -212,11 +222,22 @@ func Open(cfg Config, pay *payload.Payload) (*Engine, error) {
 	if err := e.allocPrefillBuffers(); err != nil {
 		return nil, err
 	}
+	if cfg.Layout == LayoutBoth {
+		if err := e.initDSpark(pay, head, targetRows); err != nil {
+			return nil, err
+		}
+	}
+	// The host copies of the weights have served their purpose.
+	e.blob = nil
+	debug.FreeOSMemory()
 	return e, nil
 }
 
 func (e *Engine) loadKernels() error {
 	o := &e.ops
+	if err := e.loadDraftKernel(); err != nil {
+		return err
+	}
 	for _, obj := range []struct {
 		name  string
 		image []byte
@@ -250,54 +271,63 @@ func (e *Engine) loadKernels() error {
 	return nil
 }
 
-func (e *Engine) loadWeights(pay *payload.Payload) error {
-	raw, err := pay.Get("arena.index")
+// loadWeights places the stored tensors on the GPU and derives the LM head, which it returns
+// in host memory when this layout needs it.
+func (e *Engine) loadWeights(pay *payload.Payload) (*weights.Packed, error) {
+	raw, err := pay.Data("arena.index")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := json.Unmarshal(raw, &e.index); err != nil {
-		return fmt.Errorf("arena index: %w", err)
+		return nil, fmt.Errorf("arena index: %w", err)
 	}
-	blob, err := pay.Get("arena")
+	blob, err := pay.Data("arena")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	e.vram = make(map[string]uint64, len(e.index))
 	e.blob = blob
 	if e.cfg.Layout == LayoutPrefillOnly {
 		if err := e.loadSmallTensors(blob); err != nil {
-			return err
+			return nil, err
 		}
 	} else {
 		if err := e.checkVRAM(uint64(len(blob))); err != nil {
-			return err
+			return nil, err
 		}
 		if e.arena, err = e.dev.Alloc(uint64(len(blob)), kfd.VRAM); err != nil {
-			return fmt.Errorf("weight arena: %w", err)
+			return nil, fmt.Errorf("weight arena: %w", err)
 		}
 		if err := e.loadToVRAM(e.arena.VA, blob); err != nil {
-			return err
+			return nil, err
 		}
 		for name, ent := range e.index {
 			e.vram[name] = e.arena.VA + ent.Off
 		}
 	}
-	if blob, err = pay.Get("embed"); err != nil {
-		return err
+	embed, err := pay.Data("embed")
+	if err != nil {
+		return nil, err
 	}
-	if e.embed, err = e.dev.Alloc(uint64(len(blob)), kfd.VRAM); err != nil {
-		return fmt.Errorf("embedding: %w", err)
+	if e.embed, err = e.dev.Alloc(uint64(len(embed)), kfd.VRAM); err != nil {
+		return nil, fmt.Errorf("embedding: %w", err)
 	}
-	if err := e.loadToVRAM(e.embed.VA, blob); err != nil {
-		return err
+	if err := e.loadToVRAM(e.embed.VA, embed); err != nil {
+		return nil, err
+	}
+	var head *weights.Packed
+	if e.cfg.Layout != LayoutPrefillOnly {
+		if head, err = e.buildHead(embed); err != nil {
+			return nil, err
+		}
 	}
 	if e.ropeFull, err = e.buildRope(1e6, 0.5); err != nil {
-		return err
+		return nil, err
 	}
 	if e.ropeSlide, err = e.buildRope(1e4, 1.0); err != nil {
-		return err
+		return nil, err
 	}
-	return nil
+	return head, nil
 }
 
 // loadSmallTensors places everything except the int8 decode matrices.
@@ -333,20 +363,23 @@ const vramHeadroom = 512 << 20
 // checkFootprint refuses to start, before allocating anything, when the card cannot
 // hold the weights and one full-length sequence.
 func (e *Engine) checkFootprint(pay *payload.Payload) error {
-	arena, err := pay.Get("arena")
+	arena, err := pay.RawSize("arena")
 	if err != nil {
 		return err
 	}
-	embed, err := pay.Get("embed")
+	embed, err := pay.RawSize("embed")
 	if err != nil {
 		return err
 	}
-	need := uint64(len(embed)) + 512<<20 // tensors and small buffers
+	need := embed + 512<<20 // tensors and small buffers
 	if e.cfg.Layout != LayoutPrefillOnly {
-		need += uint64(len(arena))
+		need += arena + headBytes
 	}
 	if e.cfg.Layout != LayoutDecodeOnly {
-		need += prefillWeightBytes()
+		need += prefillWeightBytes() + chunkBufferBytes()
+	}
+	if e.cfg.Layout == LayoutBoth {
+		need += dsparkBufferBytes(dsWindowMax)
 	}
 	tokens := e.cfg.FullTokens
 	if tokens == 0 {
@@ -438,9 +471,10 @@ func (e *Engine) allocRuntime() error {
 	slideBytes := uint64(nSlideLayers) * uint64(e.cfg.SlideBlocks) * KVBlock
 	convBytes := uint64(nConvLayers) * uint64(e.cfg.ConvSlots) * H * ConvState * 2
 	if e.cfg.FullTokens == 0 {
-		const prefillAndWorkspace = 2 << 30 // prefill weights and chunk tensors are allocated after this
+		// Prefill weights, chunk tensors and drafter buffers are allocated after this.
+		later := prefillWeightBytes() + chunkBufferBytes() + dsparkBufferBytes(dsWindowMax) + 128<<20
 		budget := uint64(float64(d.VRAMBytes()) * e.cfg.VRAMFraction)
-		used := e.arena.Size + e.embed.Size + e.ropeFull.Size + e.ropeSlide.Size + slideBytes + convBytes + prefillAndWorkspace
+		used := e.arena.Size + e.embed.Size + e.headBuf.Size + e.ropeFull.Size + e.ropeSlide.Size + slideBytes + convBytes + later
 		if budget <= used {
 			return fmt.Errorf("VRAM budget of %d MiB is too small (fixed needs %d MiB)", budget>>20, used>>20)
 		}
@@ -481,7 +515,8 @@ func (e *Engine) allocRuntime() error {
 	return nil
 }
 
-func (e *Engine) buildLayers() {
+// buildLayers writes the decode kernel's layer table and arguments and returns the table.
+func (e *Engine) buildLayers() []uint64 {
 	rows := make([]uint64, Layers*layerWords)
 	stepVA := e.step.VA
 	iFull, iSlide, iConv := uint64(0), uint64(0), uint64(0)
@@ -546,6 +581,7 @@ func (e *Engine) buildLayers() {
 	g[17] = stepVA + stepDone
 	g[18] = e.hostToken.VA
 	e.upload(e.layers.VA, unsafe.Slice((*uint32)(unsafe.Pointer(&rows[0])), len(rows)*2))
+	return rows
 }
 
 // submitDecode queues the megakernel with the fences ROCr uses for it. Agent scope is
@@ -571,6 +607,9 @@ const (
 
 // InitSeen sets the repetition-penalty mask to exactly the given tokens.
 func (e *Engine) InitSeen(tokens []int32, rep float32) {
+	if rep == 0 {
+		rep = 1
+	}
 	mask := make([]uint32, seenWords)
 	for _, t := range tokens {
 		if t >= 0 && t < Vocab {

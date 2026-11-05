@@ -111,3 +111,34 @@ func abs32(f float32) float32 {
 func roundEven(f float32) float32 {
 	return float32(math.RoundToEven(float64(f)))
 }
+
+// QuantizeRowsInt8 is the per-row int8 format of the drafter's Markov matrices: q = w / s,
+// with s = max |w| / 127 in fp32 for each row of an fp16 [rows, k] matrix.
+func QuantizeRowsInt8(w []uint16, rows, k int) ([]int8, []float32) {
+	q := make([]int8, rows*k)
+	scales := make([]float32, rows)
+	Parallel(rows, func(r int) {
+		src := w[r*k : (r+1)*k]
+		var m float32
+		for _, h := range src {
+			if v := abs32(fp16.ToFloat32(h)); v > m {
+				m = v
+			}
+		}
+		if m < 1e-8 {
+			m = 1e-8
+		}
+		s := m / 127
+		scales[r] = s
+		for j, h := range src {
+			v := roundEven(fp16.ToFloat32(h) / s)
+			if v > 127 {
+				v = 127
+			} else if v < -127 {
+				v = -127
+			}
+			q[r*k+j] = int8(v)
+		}
+	})
+	return q, scales
+}

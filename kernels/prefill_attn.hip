@@ -14,7 +14,7 @@
 #include <hip/hip_fp16.h>
 #include <stdint.h>
 
-namespace lfm3pa6 {
+namespace lfm3pa7 {
 
 constexpr int QH = 16, KVH = 4, D = 128, REC = 264;
 constexpr int QT = 16;              // query tokens per block
@@ -61,6 +61,17 @@ __device__ __forceinline__ float dpp_sum16(float v) {
   v += __builtin_bit_cast(float, __builtin_amdgcn_mov_dpp(__builtin_bit_cast(int, v), 0x141, 0xf, 0xf, false));
   v += __builtin_bit_cast(float, __builtin_amdgcn_mov_dpp(__builtin_bit_cast(int, v), 0x140, 0xf, 0xf, false));
   return v;
+}
+
+// exp2 for x <= 0: v_ldexp + degree 4 polynomial; ~1e-4 relative accuracy is plenty for the fp16 P'.
+__device__ __forceinline__ float fast_exp2(float x) {
+  const float fl = floorf(x);
+  const float f = x - fl;
+  float p = fmaf(f, 0.0135557f, 0.0520323f);
+  p = fmaf(f, p, 0.2413793f);
+  p = fmaf(f, p, 0.6930886f);
+  p = fmaf(f, p, 1.0000026f);
+  return __builtin_ldexpf(p, (int)fmaxf(fl, -150.f));
 }
 
 struct Params {
@@ -275,12 +286,12 @@ __global__ __launch_bounds__(THREADS, 1) void prefill_attention(Params p) {
         mx = fmaxf(mx, s[i][k]);
       }
       const float mn = fmaxf(m[i], dpp_max16(mx));
-      const float corr = m[i] == -INFINITY ? 0.f : exp2f(m[i] - mn);
+      const float corr = m[i] == -INFINITY ? 0.f : fast_exp2(m[i] - mn);
       m[i] = mn;
       float pr[4], ps = 0.f;
 #pragma unroll
       for (int k = 0; k < 4; ++k) {
-        pr[k] = valid[k] ? exp2f(s[i][k] - mn) : 0.f;
+        pr[k] = valid[k] ? fast_exp2(s[i][k] - mn) : 0.f;
         ps += pr[k];
       }
       lp[i] = lp[i] * corr + ps;
@@ -330,4 +341,4 @@ __global__ __launch_bounds__(THREADS, 1) void prefill_attention(Params p) {
   }
 }
 
-}  // namespace lfm3pa6
+}  // namespace lfm3pa7

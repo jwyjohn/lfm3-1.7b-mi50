@@ -3,11 +3,16 @@
 package payload
 
 import (
+	"bytes"
+	"compress/flate"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
+	"runtime"
+	"sync"
+	"sync/atomic"
 	"syscall"
 )
 
@@ -16,12 +21,27 @@ const (
 	footerSize = 32
 	// Align is the file alignment of every entry.
 	Align = 4096
+	// chunkBytes is the raw size of one independently coded piece of a compressed entry.
+	chunkBytes = 8 << 20
 )
 
 // Entry locates one blob relative to the start of the payload.
 type Entry struct {
 	Off  uint64 `json:"off"`
 	Size uint64 `json:"size"`
+	// Compressed entries only: the raw size, the coded size of each chunk, and the element
+	// width whose byte planes are coded apart.
+	Raw    uint64   `json:"raw,omitempty"`
+	Chunks []uint64 `json:"chunks,omitempty"`
+	Stride int      `json:"stride,omitempty"`
+}
+
+// DraftMeta holds the scalar settings of the packed DSpark drafter.
+type DraftMeta struct {
+	ConfBias  float32 `json:"conf_bias"`
+	MaskToken int     `json:"mask_token"`
+	Window    int     `json:"window"`
+	Rows      int     `json:"crop_rows"`
 }
 
 // Manifest describes the payload contents.
@@ -66,9 +86,108 @@ func (w *Writer) Add(name string, data []byte) error {
 	if _, err := w.f.Write(data); err != nil {
 		return err
 	}
-	w.m.Entries[name] = Entry{w.pos, uint64(len(data))}
+	w.m.Entries[name] = Entry{Off: w.pos, Size: uint64(len(data))}
 	w.pos += uint64(len(data))
 	return nil
+}
+
+// Compression levels of AddCompressed. Weights are close to random in their low bits, so
+// matching finds nothing in them: entropy coding alone keeps nearly all of the gain and
+// inflates much faster.
+const (
+	Entropy = flate.HuffmanOnly
+	Text    = flate.BestCompression
+)
+
+// AddCompressed appends a named blob coded in parallel chunks. With stride > 1 each chunk is
+// split into byte planes first, which suits multi-byte floats whose planes differ in entropy.
+func (w *Writer) AddCompressed(name string, data []byte, level, stride int) error {
+	n := (len(data) + chunkBytes - 1) / chunkBytes
+	coded := make([][]byte, n)
+	var firstErr atomic.Value
+	parallel(n, func(i int) {
+		raw := data[i*chunkBytes : min((i+1)*chunkBytes, len(data))]
+		var buf bytes.Buffer
+		fw, err := flate.NewWriter(&buf, level)
+		if err == nil {
+			if _, err = fw.Write(split(raw, stride)); err == nil {
+				err = fw.Close()
+			}
+		}
+		if err != nil {
+			firstErr.Store(err)
+			return
+		}
+		coded[i] = buf.Bytes()
+	})
+	if err, ok := firstErr.Load().(error); ok {
+		return err
+	}
+	if err := w.pad(Align); err != nil {
+		return err
+	}
+	if _, dup := w.m.Entries[name]; dup {
+		return fmt.Errorf("duplicate payload entry %q", name)
+	}
+	e := Entry{Off: w.pos, Raw: uint64(len(data)), Stride: stride, Chunks: make([]uint64, n)}
+	for i, c := range coded {
+		if _, err := w.f.Write(c); err != nil {
+			return err
+		}
+		e.Chunks[i] = uint64(len(c))
+		e.Size += uint64(len(c))
+	}
+	w.m.Entries[name] = e
+	w.pos += e.Size
+	return nil
+}
+
+// split separates the byte planes of elements stride bytes wide.
+func split(raw []byte, stride int) []byte {
+	if stride <= 1 {
+		return raw
+	}
+	out := make([]byte, len(raw))
+	elems := len(raw) / stride
+	for b := 0; b < stride; b++ {
+		dst := out[b*elems : (b+1)*elems]
+		for i := range dst {
+			dst[i] = raw[i*stride+b]
+		}
+	}
+	copy(out[elems*stride:], raw[elems*stride:])
+	return out
+}
+
+// join is the inverse of split.
+func join(dst, planes []byte, stride int) {
+	elems := len(dst) / stride
+	for b := 0; b < stride; b++ {
+		src := planes[b*elems : (b+1)*elems]
+		for i, v := range src {
+			dst[i*stride+b] = v
+		}
+	}
+	copy(dst[elems*stride:], planes[elems*stride:])
+}
+
+func parallel(n int, fn func(i int)) {
+	var next atomic.Int64
+	var wg sync.WaitGroup
+	for range runtime.NumCPU() {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				i := int(next.Add(1)) - 1
+				if i >= n {
+					return
+				}
+				fn(i)
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 // Close writes the manifest and footer. The footer's payload offset is zero in a
@@ -192,4 +311,56 @@ func (p *Payload) Get(name string) ([]byte, error) {
 		return nil, fmt.Errorf("payload has no entry %q", name)
 	}
 	return p.data[p.base+e.Off : p.base+e.Off+e.Size], nil
+}
+
+// RawSize is the size of a named blob once decoded.
+func (p *Payload) RawSize(name string) (uint64, error) {
+	e, ok := p.Man.Entries[name]
+	if !ok {
+		return 0, fmt.Errorf("payload has no entry %q", name)
+	}
+	if e.Chunks != nil {
+		return e.Raw, nil
+	}
+	return e.Size, nil
+}
+
+// Data returns a named blob decoded. An entry stored as is aliases the mapping and is
+// read-only; a compressed entry lands in a new slice on all CPUs.
+func (p *Payload) Data(name string) ([]byte, error) {
+	e, ok := p.Man.Entries[name]
+	if !ok {
+		return nil, fmt.Errorf("payload has no entry %q", name)
+	}
+	src := p.data[p.base+e.Off : p.base+e.Off+e.Size]
+	if e.Chunks == nil {
+		return src, nil
+	}
+	starts := make([]uint64, len(e.Chunks))
+	var off uint64
+	for i, c := range e.Chunks {
+		starts[i] = off
+		off += c
+	}
+	out := make([]byte, e.Raw)
+	var firstErr atomic.Value
+	parallel(len(e.Chunks), func(i int) {
+		dst := out[i*chunkBytes : min((i+1)*chunkBytes, len(out))]
+		planes := dst
+		if e.Stride > 1 {
+			planes = make([]byte, len(dst))
+		}
+		r := flate.NewReader(bytes.NewReader(src[starts[i] : starts[i]+e.Chunks[i]]))
+		if _, err := io.ReadFull(r, planes); err != nil {
+			firstErr.Store(fmt.Errorf("payload entry %q chunk %d: %w", name, i, err))
+			return
+		}
+		if e.Stride > 1 {
+			join(dst, planes, e.Stride)
+		}
+	})
+	if err, ok := firstErr.Load().(error); ok {
+		return nil, err
+	}
+	return out, nil
 }

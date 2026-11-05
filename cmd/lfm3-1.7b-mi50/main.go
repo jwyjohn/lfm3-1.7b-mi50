@@ -23,6 +23,7 @@ func main() {
 	vram := flag.Float64("gpu-memory-utilization", 0.90, "fraction of VRAM this process may use")
 	payloadPath := flag.String("payload", "", "read the model from this file instead of the executable (development)")
 	kvTokens := flag.Int("kv-tokens", 0, "full-attention KV capacity in tokens (0: use all remaining VRAM budget)")
+	noDraft := flag.Bool("no-draft", false, "serve greedy requests without DSpark speculation")
 	flag.Parse()
 
 	// The heap holds only small request state; collecting rarely keeps the token loop clean.
@@ -40,7 +41,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	raw, err := pay.Get("tokenizer")
+	raw, err := pay.Data("tokenizer")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -49,7 +50,7 @@ func main() {
 		log.Fatal(err)
 	}
 	start := time.Now()
-	engine, err := model.Open(model.Config{MaxContext: *maxContext, VRAMFraction: *vram, FullTokens: *kvTokens}, pay)
+	engine, err := model.Open(model.Config{MaxContext: *maxContext, VRAMFraction: *vram, FullTokens: *kvTokens, NoDraft: *noDraft}, pay)
 	if err != nil {
 		log.Fatal(err)
 	}

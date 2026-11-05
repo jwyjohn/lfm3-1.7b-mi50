@@ -22,7 +22,7 @@ func loadTok(t *testing.T) *tokenizer.Tokenizer {
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw, err := p.Get("tokenizer")
+	raw, err := p.Data("tokenizer")
 	if err != nil {
 		t.Fatal(err)
 	}

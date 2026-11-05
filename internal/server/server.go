@@ -89,8 +89,8 @@ func (s *Server) worker() {
 		if err != nil {
 			log.Printf("generation failed: %v", err)
 		} else {
-			log.Printf("prompt %d (cached %d) in %.2f s, output %d at %.1f tok/s", res.PromptTokens, res.CachedTokens,
-				res.PrefillTime.Seconds(), res.Output, float64(res.Output)/max(res.DecodeTime.Seconds(), 1e-9))
+			log.Printf("prompt %d (cached %d) in %.2f s, output %d at %.1f tok/s, %d rounds, %d verified, %d drafts accepted", res.PromptTokens, res.CachedTokens,
+				res.PrefillTime.Seconds(), res.Output, float64(res.Output)/max(res.DecodeTime.Seconds(), 1e-9), res.Rounds, res.Verified, res.Accepted)
 		}
 		j.done <- jobResult{res, err}
 	}
