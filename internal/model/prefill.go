@@ -24,7 +24,26 @@ const (
 	maxChunk      = 7680
 	shortChunk    = 2048
 	longChunkFrom = 32768
+	// splitRows bounds tokens x key splits of one attention launch; splitPart is one partial
+	// result in floats (128 dims, max, sum, bias, padding).
+	splitRows = 4096
+	splitPart = D + 4
 )
+
+// attnSplits picks how many parts the attention of a chunk is split into along the keys: enough
+// 512-thread blocks for 8 rounds of the 60 CUs, at least 32 key tiles of 64 per part. Long chunks
+// fill the GPU by themselves; short ones (2048-token chunks, a prompt's last partial chunk)
+// otherwise leave CUs idle while a few long blocks finish.
+func attnSplits(tokens, context, window int) int {
+	keys := context + tokens
+	if window > 0 {
+		keys = min(window, keys)
+	}
+	tiles := (keys + 63) / 64
+	blocks := (tokens + 31) / 32 * KVH
+	want := (480 + blocks - 1) / blocks
+	return max(1, min(want, tiles/32, 8, splitRows/max(tokens, 1)))
+}
 
 // g128Weight is one linear layer in the GEMM kernel's packed layout.
 type g128Weight struct {
@@ -45,6 +64,7 @@ type opKernels struct {
 	stateCopy, upload, blit         *kfd.Kernel
 	quantizePack, quantizePackGated *kfd.Kernel
 	gemm, quantizeQ, attention      *kfd.Kernel
+	combine                         *kfd.Kernel
 }
 
 // prefillBuffers are the fixed chunk-sized activation tensors.
@@ -54,6 +74,7 @@ type prefillBuffers struct {
 	y, o, a, q, gu, d *kfd.Buffer
 	aPacked, aScales  *kfd.Buffer
 	qbuf              *kfd.Buffer
+	attnSplits        *kfd.Buffer
 	hostLogits        *kfd.Buffer
 }
 
@@ -219,6 +240,8 @@ func (p *prefillBuffers) chunkSizes() map[**kfd.Buffer]uint64 {
 		&p.aPacked: maxChunk * I,
 		&p.aScales: maxChunk * I / weights.Group * 4,
 		&p.qbuf:    maxChunk * QH * qrowDwords * 4,
+		// partial attention results when a chunk is split along the keys (see attnSplits)
+		&p.attnSplits: splitRows * QH * splitPart * 4,
 	}
 }
 
@@ -450,18 +473,42 @@ func (e *Engine) PrefillChunk(ids []int32, context int, convSlot int32, hasIniti
 				blockSize, context, fStride, pad32 int32
 			}{p.f.VA, arena("k_norm"), rope, kv, KVBlock, Rec, KVH * Rec, table, BlockTokens, int32(context), mixColumns, 0}
 			e.launch(o.kvWrite, rows*KVH, 1, 64, unsafe.Pointer(&ka), 80)
-			pa := struct {
-				q, out, kv              uint64
-				kvBlock, kvHead, kvSlot int64
-				table                   uint64
-				blockSize, tokens       int32
-				context, window         int32
-				qStride, outStride      int64
-				qbuf                    uint64
-			}{p.q.VA, p.a.VA, kv, KVBlock, Rec, KVH * Rec, table, BlockTokens, int32(T), int32(context), window, H, H, p.qbuf.VA}
-			e.launch(o.quantizeQ, rows*QH, 1, 64, unsafe.Pointer(&pa), 96)
-			blocks := (rows + 15) / 16
-			e.launch(o.attention, blocks, KVH, 256, unsafe.Pointer(&pa), 96)
+			if e.cfg.ExactAttention {
+				pa := struct {
+					q, out, kv              uint64
+					kvBlock, kvHead, kvSlot int64
+					table                   uint64
+					blockSize, tokens       int32
+					context, window         int32
+					qStride, outStride      int64
+					qbuf                    uint64
+				}{p.q.VA, p.a.VA, kv, KVBlock, Rec, KVH * Rec, table, BlockTokens, int32(T), int32(context), window, H, H, p.qbuf.VA}
+				e.launch(o.quantizeQ, rows*QH, 1, 64, unsafe.Pointer(&pa), unsafe.Sizeof(pa))
+				e.launch(o.attention, (rows+15)/16, KVH, 256, unsafe.Pointer(&pa), unsafe.Sizeof(pa))
+			} else {
+				splits := attnSplits(T, context, int(window))
+				pa := struct {
+					q, out, kv              uint64
+					kvBlock, kvHead, kvSlot int64
+					table                   uint64
+					blockSize, tokens       int32
+					context, window         int32
+					qStride, outStride      int64
+					qbuf                    uint64
+					splits, pad             int32
+					ws                      uint64
+				}{p.q.VA, p.a.VA, kv, KVBlock, Rec, KVH * Rec, table, BlockTokens, int32(T), int32(context), window, H, H, p.qbuf.VA,
+					int32(splits), 0, p.attnSplits.VA}
+				e.launch(o.quantizeQ, rows*QH, 1, 64, unsafe.Pointer(&pa), unsafe.Sizeof(pa))
+				// One 512-thread block per 32 query tokens, kv head and key split (kernels/prefill_attn.hip).
+				e.q.Submit(&kfd.Dispatch{
+					Kernel: o.attention, Grid: [3]uint32{uint32((rows+31)/32) * 512, KVH, uint32(splits)}, Block: [3]uint16{512},
+					Args: unsafe.Pointer(&pa), ArgSize: unsafe.Sizeof(pa), Acquire: kfd.ScopeAgent, Release: kfd.ScopeAgent,
+				})
+				if splits > 1 {
+					e.launch(o.combine, rows*QH, 1, 64, unsafe.Pointer(&pa), unsafe.Sizeof(pa))
+				}
+			}
 			ga := struct {
 				a, f   uint64
 				stride int32

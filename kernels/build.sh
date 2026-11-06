@@ -12,5 +12,13 @@ for src in *.hip; do
   [ "$name" = dspark ] && flags=(-mllvm -disable-machine-licm)
   docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/src" -w /src --entrypoint /opt/rocm/bin/hipcc "$image" \
     -O3 -w --offload-arch=gfx906 --genco --no-gpu-bundle-output "${flags[@]}" -o "$name.co" "$src"
+  # The driver provides no scratch memory: a VGPR spill or a private segment is a build error
+  # (SGPR spills go to VGPR lanes, not memory).
+  notes=$(docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/src" -w /src --entrypoint /opt/rocm/llvm/bin/llvm-readelf "$image" \
+    --notes "$name.co")
+  if grep -E "(vgpr_spill_count|private_segment_fixed_size): +[1-9]" <<<"$notes"; then
+    echo "$name.co spills registers or uses scratch memory" >&2
+    exit 1
+  fi
   echo "built $name.co"
 done

@@ -24,6 +24,7 @@ func main() {
 	payloadPath := flag.String("payload", "", "read the model from this file instead of the executable (development)")
 	kvTokens := flag.Int("kv-tokens", 0, "full-attention KV capacity in tokens (0: use all remaining VRAM budget)")
 	noDraft := flag.Bool("no-draft", false, "serve greedy requests without DSpark speculation")
+	exactAttention := flag.Bool("exact-attention", false, "prefill attention with fp16 softmax probabilities: about half the attention speed, the previous long-context error")
 	flag.Parse()
 
 	// The heap holds only small request state; collecting rarely keeps the token loop clean.
@@ -50,7 +51,7 @@ func main() {
 		log.Fatal(err)
 	}
 	start := time.Now()
-	engine, err := model.Open(model.Config{MaxContext: *maxContext, VRAMFraction: *vram, FullTokens: *kvTokens, NoDraft: *noDraft}, pay)
+	engine, err := model.Open(model.Config{MaxContext: *maxContext, VRAMFraction: *vram, FullTokens: *kvTokens, NoDraft: *noDraft, ExactAttention: *exactAttention}, pay)
 	if err != nil {
 		log.Fatal(err)
 	}

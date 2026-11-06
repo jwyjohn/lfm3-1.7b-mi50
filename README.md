@@ -10,11 +10,11 @@ It replaces a vLLM deployment of the same model on the same card, running the sa
 
 | Context | TTFT, vLLM → this | Greedy decode tok/s, vLLM → this |
 |---|---|---|
-| 1k | 0.201 → 0.126 s | 974 → 1207 |
-| 32k | 5.829 → 5.678 s | 364 → 613 |
-| 128k | 44.738 → 44.343 s | 301 → 307 |
+| 1k | 0.201 → 0.124 s | 974 → 1207 |
+| 32k | 5.829 → 4.617 s | 364 → 613 |
+| 128k | 44.738 → 28.739 s | 301 → 307 |
 
-TTFT, prefill, warm starts and the sampling path are better at every tier. The decode column above is a median of 3 streams and is **very noisy, so do not read it alone**: over 72 streams the two tie overall (mean 559 → 545), and with repetition-loop streams separated, normal text is 5% to 16% faster at every tier. See [Evaluation](#evaluation), and the [optimization report](docs/OPTIMIZATION_REPORT.md) (Chinese) for the whole history.
+TTFT, prefill, warm starts and the sampling path are better at every tier. Prefill attention runs PV in int8 with u8 softmax probabilities, twice as fast as the fp16 version; this costs some long-context precision, and `--exact-attention` restores the fp16 kernel (see [Correctness](#correctness)). The decode column above is a median of 3 streams and is **very noisy, so do not read it alone**: over 72 streams the two tie overall (mean 559 → 545), and with repetition-loop streams separated, normal text is 5% to 16% faster at every tier. See [Evaluation](#evaluation), and the [optimization report](docs/OPTIMIZATION_REPORT.md) (Chinese) for the whole history.
 
 Only `temperature: 0` requests use DSpark. The model's default temperature is 0.1, which takes the sampling path at about 260 tok/s. vLLM behaves the same way.
 
@@ -119,7 +119,8 @@ Go cannot target the GPU, and the existing kernels are heavily tuned, so they st
 
 - `dspark.hip`: the DSpark megakernel. One launch does draft, verify and commit on the GPU, up to 32 rounds. Greedy requests use it.
 - `decode.hip`: the decode megakernel. One persistent launch runs all 24 layers and the LM head, one token at a time. Sampling, logprobs and `min_tokens` requests use it.
-- `prefill_attn.hip`: flash attention over the paged int8 KV cache.
+- `prefill_attn.hip`: flash attention over the paged int8 KV cache, with int8 QK and int8 PV (u8 softmax probabilities per 64-key tile).
+- `prefill_attn_exact.hip`: the previous flash attention with fp16 probabilities, for `--exact-attention`.
 - `gemm.hip`: W8A8 matrix multiply for every prefill linear layer.
 - `ops.hip`: new. Native versions of what vLLM ran through torch or JIT-compiled Triton: embedding, RMS norm, causal conv, Q/K norm and RoPE, int8 KV store, gate, and the fp16 LM head.
 
@@ -171,6 +172,7 @@ These are the things that took debugging. They constrain future changes, and the
 - **Doorbells and HDP registers take plain stores.** Go's `atomic.Store` is a locked `XCHG` on amd64. The doorbell value is the last packet's id, not the write index.
 - **The decode kernel had a race, now fixed.** It prefetched `h_old` before the grid barrier. That is safe for every layer except layer 0, whose `h0` was written by block 0 in the phase just finished, so other blocks could read the previous token's embedding and compute a whole block wrong. In this driver it appeared above 16 blocks. It depends on timing: the unfixed kernel under ROCr passed the same bit-exact test, and why was not established. The fix is one line in `decode.hip`. Under ROCr it adds about 0.6% kernel time and left the first 256 greedy tokens unchanged on all 33 benchmark requests, so the race was not behind vLLM's lower agreement with HF below.
 - **Wait before acquiring the VM.** Opening the render node starts asynchronous page-table updates in the kernel. If `ACQUIRE_VM` follows within about a millisecond, they overwrite the page directory entries KFD writes for its trap handler. A process runs normally without that mapping until a running wave is preempted, which happens whenever any process's queues change: the wave cannot fetch the trap handler, and the queue hangs. ROCr is slow enough between the two calls never to hit this. Here it appeared as an occasional hang at startup beside vLLM, because the host memory compaction during startup made KFD stop and restart vLLM's queues. A page-table walk through debugfs showed the entry missing, and a 1 ms delay restored it. `kfd.Open` waits 200 ms, since there is no ioctl to wait for those updates.
+- **The prefill attention kernel must not spill either.** It runs at 512 threads per block, which caps it at 128 VGPRs, and the driver has no scratch memory. Three compiler behaviors broke that while it was written, and the code works around each: values computed before a barrier were sunk past it to their use, keeping every loaded operand live (the logits and accumulators are pinned with empty `asm` statements); identical barriers in two branches let the compiler merge the two wave groups' loops (each group's barrier asm differs); and two conditional stores of the two halves of one loaded pair were merged into one store of the wrong half (each thread now loads one dword into one variable). `kernels/build.sh` fails if any kernel spills or needs scratch.
 - **Do not fill VRAM.** When VRAM runs out the kernel evicts other processes' buffers into host RAM, which can invoke the OOM killer. The program therefore checks free VRAM up front, keeps 512 MiB of headroom and refuses to start rather than evict.
 
 ## API
@@ -195,6 +197,7 @@ Differences from vLLM's API:
 | `--kv-tokens` | from VRAM | Full-attention KV capacity, in tokens |
 | `--payload` | the executable | Read the model from a separate payload file (development) |
 | `--no-draft` | off | Keep greedy requests off DSpark, for comparison |
+| `--exact-attention` | off | Prefill attention with fp16 softmax probabilities: half the attention speed (128k TTFT 44.4 s instead of 28.7 s), the long-context precision of the previous release |
 
 ## Project layout
 
@@ -226,13 +229,15 @@ Single stream, streaming responses, 1024 output tokens, cold cache, temperature 
 
 | Context | Input tokens | TTFT vLLM | TTFT this | Prefill tok/s vLLM | Prefill tok/s this | Decode tok/s vLLM | Decode tok/s this |
 |---|---|---|---|---|---|---|---|
-| 1k | 1024 | 0.201 s | 0.126 s | 5090 | 8135 | 974.2 | 1206.8 |
-| 8k | 8192 | 1.157 s | 1.044 s | 7082 | 7843 | 532.3 | 954.4 |
-| 32k | 32768 | 5.829 s | 5.678 s | 5622 | 5771 | 363.5 | 612.7 |
-| 64k | 65536 | 15.574 s | 15.371 s | 4208 | 4264 | 412.8 | 449.6 |
-| 128k | 126976 | 44.738 s | 44.343 s | 2838 | 2863 | 301.0 | 307.4 |
+| 1k | 1024 | 0.201 s | 0.124 s | 5090 | 8230 | 974.2 | 1206.8 |
+| 8k | 8192 | 1.157 s | 0.983 s | 7082 | 8330 | 532.3 | 954.4 |
+| 32k | 32768 | 5.829 s | 4.617 s | 5622 | 7096 | 363.5 | 612.7 |
+| 64k | 65536 | 15.574 s | 11.187 s | 4208 | 5858 | 412.8 | 449.6 |
+| 128k | 126976 | 44.738 s | 28.739 s | 2838 | 4418 | 301.0 | 307.4 |
 
-Multi-turn replay with a warm prefix cache (3 sessions of 3 turns), median of the 9 requests:
+TTFT and prefill are from `benchmarks/lfm3-1.7b-mi50_cold.txt`, after the int8 PV prefill attention. The decode columns are from the run before it (`benchmarks/lfm3-1.7b-mi50_cold_exact-attention.txt`, the same numbers `--exact-attention` gives): the decode kernels did not change, and a fresh run's greedy medians move by the repetition-loop lottery described below. The attention kernel alone is 2.06 times as fast on a 128k prompt (32.6 s to 15.9 s over all layers); see `benchmarks/prefill_attention.txt`.
+
+Multi-turn replay with a warm prefix cache (3 sessions of 3 turns), median of the 9 requests, measured before the int8 PV prefill attention:
 
 | Tier | TTFT vLLM | TTFT this | Decode tok/s vLLM | Decode tok/s this |
 |---|---|---|---|---|
@@ -241,7 +246,7 @@ Multi-turn replay with a warm prefix cache (3 sessions of 3 turns), median of th
 
 Cached token counts matched vLLM on all 18 requests.
 
-The sampling path (temperature 0.6, top_p 0.95, top_k 20, no DSpark):
+The sampling path (temperature 0.6, top_p 0.95, top_k 20, no DSpark), measured before the int8 PV prefill attention:
 
 | Tier | Decode tok/s vLLM | Decode tok/s this |
 |---|---|---|
@@ -285,7 +290,9 @@ So 72 further streams were measured (the same prompts minus their first 16·v to
 | Determinism, DSpark, 15 benchmark requests | First 256 tokens identical across runs |
 | Determinism under preemption, 2000 decode steps while 130 other processes created queues | Bit-identical, no GPU faults (measured before DSpark) |
 
-**GEMV's x is int8.** This is the one place speed was bought with precision: 8% to 17% per round, at a KL about 6 times fp16's (0.0028 vs 0.0004) and 1 to 4 more top-1 flips in 119 positions, all where the top two are close. The fp16 fallback needs scratch memory, which the Go driver does not have.
+**Prefill attention's softmax probabilities are u8.** P' = p x V scale is quantized per row and 64-key tile against the tile's largest value, and PV runs on `v_dot4`. In an HF fp32 simulation of the kernels' quantization, the KL of the last 192 next-token distributions against fp32 is unchanged at 16k (0.00025) and rises at 60k from 0.0171 to 0.0251 (mean of two sessions; top-1 agreement 96.1% to 93.0%). For reference, the int8 KV cache alone gives 0.031 on the harder session. Per-row quantization of P, which the old vLLM deployment used, collapses long outputs (KL 4.8); the per-tile scale does not. `--exact-attention` brings back fp16 P at half the attention speed. Details in `benchmarks/prefill_attention.txt`.
+
+**GEMV's x is int8.** This was the first place speed was bought with precision: 8% to 17% per round, at a KL about 6 times fp16's (0.0028 vs 0.0004) and 1 to 4 more top-1 flips in 119 positions, all where the top two are close. The fp16 fallback needs scratch memory, which the Go driver does not have.
 
 Read these with some care:
 

@@ -111,6 +111,11 @@ type Config struct {
 	// NoDraft keeps greedy requests on the one-token decode kernel.
 	NoDraft bool
 
+	// ExactAttention runs prefill attention with fp16 softmax probabilities (the kernel in
+	// kernels/prefill_attn_exact.hip) instead of u8 ones: about half the attention speed, and the
+	// long-context error of the previous release.
+	ExactAttention bool
+
 	// Zero values pick defaults sized for MaxContext and VRAMFraction.
 	FullTokens  int // KV capacity of full-attention layers, tokens
 	SlideBlocks int // ring of KV blocks for sliding-attention layers
@@ -238,15 +243,19 @@ func (e *Engine) loadKernels() error {
 	if err := e.loadDraftKernel(); err != nil {
 		return err
 	}
+	attnImage := kernels.PrefillAttn
+	attnKernels := map[string]**kfd.Kernel{"quantize_q": &o.quantizeQ, "prefill_attention": &o.attention, "combine": &o.combine}
+	if e.cfg.ExactAttention {
+		attnImage = kernels.PrefillAttnExact
+		attnKernels = map[string]**kfd.Kernel{"quantize_q": &o.quantizeQ, "prefill_attention": &o.attention}
+	}
 	for _, obj := range []struct {
 		name  string
 		image []byte
 		want  map[string]**kfd.Kernel
 	}{
 		{"decode", kernels.Decode, map[string]**kfd.Kernel{"decode_kernel": &e.kDecode}},
-		{"prefill attention", kernels.PrefillAttn, map[string]**kfd.Kernel{
-			"quantize_q": &o.quantizeQ, "prefill_attention": &o.attention,
-		}},
+		{"prefill attention", attnImage, attnKernels},
 		{"gemm", kernels.Gemm, map[string]**kfd.Kernel{
 			"quantize_packILb0": &o.quantizePack, "quantize_packILb1": &o.quantizePackGated, "4gemmE": &o.gemm,
 		}},

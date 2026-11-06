@@ -1,6 +1,6 @@
 # LFM3-1.7B on MI50：从零开始的优化记录
 
-这份报告记录把 [LiquidAI/LFM3-1.7B](https://huggingface.co/LiquidAI/LFM3-1.7B)（项目最早两步用的是同系列的 LFM3-VL-2B）跑在一张 2018 年的 AMD Radeon Instinct MI50（gfx906，官方已不再支持）上的全过程，时间是 2026-10-29 到 2026-11-05。每一步都写明做了什么、为什么做、效果多少。所有数字都是在这张卡上测的。
+这份报告记录把 [LiquidAI/LFM3-1.7B](https://huggingface.co/LiquidAI/LFM3-1.7B)（项目最早两步用的是同系列的 LFM3-VL-2B）跑在一张 2018 年的 AMD Radeon Instinct MI50（gfx906，官方已不再支持）上的全过程，时间是 2026-10-29 到 2026-11-06。每一步都写明做了什么、为什么做、效果多少。所有数字都是在这张卡上测的。
 
 ## 摘要
 
@@ -14,7 +14,8 @@
 | 重叠等待 | 10-31 | 46.5 s | 200.8 | 是 |
 | Go + KFD 直连 | 11-02 | 46.0 s | 208.1 | 是 |
 | DSpark（vLLM 上） | 11-04 | 44.7 s | 301.0 | 是，见[保真度](#gemv-的-x-改为-int8) |
-| DSpark（Go，当前版本） | 11-05 | 44.3 s | 307.4 | 同上 |
+| DSpark（Go） | 11-05 | 44.3 s | 307.4 | 同上 |
+| prefill attention 换 int8 PV（Go，当前版本） | 11-06 | 28.7 s | 307.4（decode 未改） | 是，长上下文 KL 略升，见[第 10 节](#10-第四阶段prefill-attention-翻倍11-06) |
 
 decode 的后两行是 3 条流的中位数，受 τ 的混沌影响很大，读之前请先看[第 6 节](#6-为什么单条流的数字不能比)。
 
@@ -26,6 +27,8 @@ decode 的后两行是 3 条流的中位数，受 τ 的混沌影响很大，读
 - **真实问答（MATH + GPQA，greedy）：** decode 高于 vLLM（MATH 616→639.5，GPQA 504.6→507.5），约为不用 draft 时的 2 倍（293 / 291），准确率没有下降。
 
 可执行文件从 2.3 GB 降到 1.97 GB，同时多装了一个 drafter 模型。
+
+之后 prefill attention 换成 int8 PV（第 10 节）：kernel 本身快 2.06 倍，128k 首 token 44.3 s → 28.7 s，32k 5.68 s → 4.62 s。代价是 softmax 概率从 fp16 变成 u8，60k 上下文对 HF fp32 的 KL 从 0.0171 升到 0.0251；`--exact-attention` 可以换回原来的 kernel。
 
 ## 1. 硬件
 
@@ -290,8 +293,81 @@ verify 的数值和 M 有关：M 不同，注意力的分组不同，浮点取�
 ## 9. 还没解决的
 
 - **785 GB/s。** 持续读只有理论值的 77%，原因没查清。
-- **178 W。** 突破要改 powerplay 或降压，是硬件层面的决定，没有动。
+- **178 W。** 突破要改 powerplay 或降压，是硬件层面的决定，没有动。prefill attention 现在也受它限制：持续运行时频率在 1556 和 1711 MHz 之间切换。
+- **u8 的 softmax 概率。** prefill attention 的提速建立在它之上，60k 的 KL 升高约 47%。试过的两种修正（分母也用量化值、32 key 一块）都没有带来净收益；需要 fp16 精度时用 `--exact-attention`。
 - **int8 x 的保真度。** 回退需要驱动先支持 scratch。
 - **drafter 权重还在训练。** 新权重到了要重新回放策略：`./build.sh model <新权重目录>` 即可重建。
 - **只测了这一张卡。** 没有长时间稳定性测试，最长的一次是准确率评测。
 - **默认 temperature 是 0.1。** 模型的默认采样参数不走 DSpark，约 260 tok/s。要 DSpark 需 `temperature: 0`。这和 vLLM 行为一致。
+
+## 10. 第四阶段：prefill attention 翻倍（11-06）
+
+128k 预填充的 44.3 s 里，attention 占 32.6 s（6 个全注意力层 × 18 个 7680 token 的 chunk，加 5 个滑动窗口层）。目标是让这一步至少快一倍。所有 kernel 都先在 vLLM 开发环境里用同一套 ROCm 7.2.4 工具链编成 code object，通过 HIP module API 加载测试，测的就是 Go 会加载的字节；再迁回 Go。
+
+### 为什么必须换掉 fp16 PV
+
+旧 kernel（16 token × 4 head 一个 block，QK 用 int8 `v_dot4`，PV 用 fp16 `v_dot2`）每个 score 要 32 条 QK 点积加 64 条 PV 点积。即使 VALU 100% 忙，128k 的下限也约 13.5 s，翻倍要做到这个下限的 93%，不现实。PV 也换成 `v_dot4`，点积数降到 64 条，才有空间。
+
+P 不能按整行量化，那正是第一阶段长上下文崩坏的原因之一（"快，但全错了"）。新方案按**每行、每 64 个 key 的 tile** 量化：P' = p × V scale，相对 tile 内最大的 P' 量化成 u8（0–255，就近取偶），V 加 128 变成无符号，`v_dot4_u32_u8` 累加到 u32，最后减去 128 × ΣP'。每个 tile 有自己的尺度，远处的小概率 tile 不会被一个大值压成 0。
+
+### 一步步变快（128k 的 attention 合计，旧 kernel 32.6 s）
+
+| 版本 | 改动 | 128k 合计 |
+|---|---|---|
+| v8 | int8 PV；512 线程、32 token × 4 head 一个 block，每个 SIMD 2 个 wave；`v_exp_f32`；最大值懒更新（超过 2^8 才 rescale） | 约 23 s（按单点比例估算），但寄存器溢出到 scratch，不能用 |
+| v9 | 全展开（`sched_barrier` 控住加载）；mask 只在边界 tile 做；P' 最大值的规约用带 DPP 的 `v_max` 四行交错 | 约 19.5 s（按单点比例估算） |
+| v14 | QK 的 int32 部分和从 1.5·2^23 的位模式开始累加，读回来直接是 float，每组一次 fma；K 提前两列取；KV 步长写成常量 | 17.0 s |
+| v30 | wave 0–3 先做 tile s 的 QK+softmax 再做 PV，wave 4–7 先做 tile s−1 的 PV 再做 tile s 的 QK+softmax；每个 SIMD 一个 wave 在算 QK、另一个在算 PV，LDS 请求错开；K/V 双缓冲，每个 tile 2 个 barrier | 16.6 s |
+| v41 | `s_setprio`：QK 2、PV 1、softmax 0，让 LDS 密集的 QK 先发射 | **15.9 s（2.06 倍）** |
+
+另加了沿 key 的拆分（grid z 加 combine kernel），给 2048 token 的 chunk 和 prompt 末尾的短 chunk 用：128k 的最后一块（512 token，上下文 130560）从 55.7 ms 降到 21.4 ms。
+
+v30 让 LDS 等待减少 65%（计数器 SQ_WAIT_INST_LDS），VALU 忙碌率约 81%。这张卡在功耗墙（178 W）上：持续运行时频率在 1556 和 1711 MHz 之间切换，单点测量（有空隙）比连续跑一个 prompt 快约 8%，表里的数字都是连续跑的。
+
+### 试过但没有用的
+
+| 方案 | 结果 | 原因 |
+|---|---|---|
+| Q 每行一个 scale（G=1） | 快 2%，60k KL 0.029→0.057（fp16 P 下） | 精度不可接受，保持每 32 维一组 |
+| 分母也用量化后的权重 | 60k KL 0.029→0.071 | 噪声进了分母 |
+| P' 每 32 key 一块 | 随机数据误差 −8%，慢 5% | 收尾开销翻倍，没有换来净收益 |
+| 生产者/消费者分工（4 个 wave 算 QK+softmax，4 个算 PV） | 慢 4% | 生产者每 tile 约 1500 条 VALU、消费者约 1190 条，消费者在 barrier 空等 |
+| PV 单遍（32 个累加器） | 慢 2–3%，试了四次 | 寄存器只够丢掉预取，LDS 省下的不够补 |
+| PV 收尾也用位模式技巧（每 16 个 tile 扣一次偏移） | 无变化 | 受功耗和 LDS 限制，省掉便宜的 VALU 指令没有用 |
+| Q 量化并进 attention kernel | 滑动窗口层快 20%，全注意力层稍慢，合计不变 | |
+| 去掉所有 barrier（只为测上限） | 快 3.6% | barrier 不是主要开销 |
+
+### 编译器的坑
+
+512 线程的 block 把 VGPR 限在 128，驱动又没有 scratch，下面几处每一处都会造成大量溢出：
+
+- barrier 之前算好的值被挪到 barrier 之后的使用处，导致所有加载过的操作数都活到那里（383 个寄存器溢出）。用空的 `asm volatile("" : "+v"(x))` 把 logits 和累加器钉在原处。
+- 两个分支里一模一样的 barrier 内联汇编，会让编译器把两组 wave 的循环合并。两组的 barrier 字符串不同。
+- 一对 8 字节加载的两半在两个条件下分别存到 LDS，被合并成一次存储，而且存的是错的那一半（V scale 读成了 V 的数据）。改成每个线程只加载一个 dword 到一个变量。
+- 立即数偏移的 `buffer_load ... lds` 会把偏移同时加到 LDS 地址上，编译器设 M0 时没扣掉（最终没用 LDS DMA）。
+
+`kernels/build.sh` 现在会检查每个 code object：有 VGPR 溢出或 private segment 就构建失败。
+
+### 精度
+
+用 HF fp32 模型模拟 kernel 的量化（int8 K/V、每 32 维一组的 int8 Q、各自的 P 量化），比较最后 192 个位置的下一 token 分布：
+
+| | 16k | 60k 会话 A | 60k 会话 B | 60k 均值 |
+|---|---|---|---|---|
+| 仅 int8 KV | 0.00012 / 100% | 0.0307 / 94.8% | | |
+| 旧 kernel（fp16 P） | 0.00025 / 100% | 0.0290 / 94.3% | 0.0051 / 97.9% | 0.0171 / 96.1% |
+| 新 kernel（u8 P） | 0.00025 / 99.5% | 0.0434 / 88.5% | 0.0067 / 97.4% | 0.0251 / 93.0% |
+
+（KL / top-1 一致率。）16k 看不出差别；60k 的 KL 升高约 47%，但离第一阶段的崩坏（KL 4.8）差得很远。输出逐位确定（prefill 三次 logits 完全相同）。需要旧精度时加 `--exact-attention`，它运行原来的 kernel（`kernels/prefill_attn_exact.hip`），128k 首 token 回到 44.4 s。
+
+### 端到端
+
+| 上下文 | 首 token 前 → 后 | prefill tok/s 前 → 后 |
+|---|---|---|
+| 1k | 0.126 → 0.124 s | 8135 → 8230 |
+| 8k | 1.044 → 0.983 s | 7843 → 8330 |
+| 32k | 5.678 → 4.617 s | 5771 → 7096 |
+| 64k | 15.371 → 11.187 s | 4264 → 5858 |
+| 128k | 44.343 → 28.739 s | 2863 → 4418 |
+
+kernel 级的明细在 `benchmarks/prefill_attention.txt`。

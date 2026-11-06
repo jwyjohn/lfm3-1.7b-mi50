@@ -13,6 +13,9 @@ var DSpark []byte
 //go:embed prefill_attn.co
 var PrefillAttn []byte
 
+//go:embed prefill_attn_exact.co
+var PrefillAttnExact []byte
+
 //go:embed gemm.co
 var Gemm []byte
 

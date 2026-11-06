@@ -1,0 +1,32 @@
+Prefill attention kernel, before (exact: fp16 P, kernels/prefill_attn_exact.hip) and after
+(kernels/prefill_attn.hip). Random int8 KV cache in the engine's layout, Q quantization included,
+timed with HIP events on the MI50 (power-capped at 178 W). Measured with the harness of the
+development tree (fa/harness.py); chunks follow the engine: 7680 tokens from 32k prompts on, 2048 below.
+
+One 131072-token prompt (6 full-attention layers x 18 chunks + 5 sliding layers), back to back:
+  exact   32.64 s, 32.70 s
+  now     15.85 s, 15.87 s          2.06x
+
+Single launches (T = chunk tokens, ctx = cached tokens before the chunk, w = sliding window):
+  T  2048 ctx      0 w   0:  exact    1.43 ms  now    0.72 ms  1.98x
+  T  2048 ctx   8192 w   0:  exact   12.26 ms  now    6.34 ms  1.93x
+  T  2048 ctx  22528 w   0:  exact   31.27 ms  now   15.57 ms  2.01x
+  T  2048 ctx  30720 w   0:  exact   42.23 ms  now   20.96 ms  2.01x
+  T  7680 ctx      0 w   0:  exact   19.16 ms  now    9.53 ms  2.01x
+  T  7680 ctx  32768 w   0:  exact  176.20 ms  now   85.96 ms  2.05x
+  T  7680 ctx  61440 w   0:  exact  313.47 ms  now  153.24 ms  2.05x
+  T  7680 ctx 115200 w   0:  exact  573.34 ms  now  278.94 ms  2.06x
+  T   512 ctx 130560 w   0:  exact   55.70 ms  now   21.42 ms  2.60x  (split along the keys)
+  T  2048 ctx  30720 w 256:  exact    0.54 ms  now    0.35 ms  1.52x
+  T  7680 ctx 115200 w 256:  exact    2.01 ms  now    1.26 ms  1.60x
+
+Precision, simulated with the HF fp32 model (int8 K/V and Q as in the kernels, P quantized as in
+each kernel), full-vocabulary KL of the last 192 next-token distributions against fp32, and top-1
+agreement. Two distinct 60k Open-SWE sessions (multi-t65536 lines 0 and 3) and one at 16k:
+                           16k               60k session A      60k session B      60k mean
+  int8 K/V only            0.00012 / 100%    0.0307 / 94.8%
+  exact (fp16 P)           0.00025 / 100%    0.0290 / 94.3%     0.0051 / 97.9%     0.0171 / 96.1%
+  now (u8 P per 64 keys)   0.00025 / 99.5%   0.0434 / 88.5%     0.0067 / 97.4%     0.0251 / 93.0%
+Rejected on the way:
+  denominator from the quantized weights          0.0711 / 87.5%     0.0091 / 96.4%
+  Q with one scale per row (fp16 P)               0.0573 / 92.7%

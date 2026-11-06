@@ -10,11 +10,11 @@
 
 | 上下文 | TTFT，vLLM → 本项目 | greedy decode tok/s，vLLM → 本项目 |
 |---|---|---|
-| 1k | 0.201 → 0.126 s | 974 → 1207 |
-| 32k | 5.829 → 5.678 s | 364 → 613 |
-| 128k | 44.738 → 44.343 s | 301 → 307 |
+| 1k | 0.201 → 0.124 s | 974 → 1207 |
+| 32k | 5.829 → 4.617 s | 364 → 613 |
+| 128k | 44.738 → 28.739 s | 301 → 307 |
 
-TTFT、prefill、热启动和采样路径在每一档都更好。上表的 decode 是 3 条流的中位数，**受混沌影响很大，不能单独看**：72 条流的总体基本打平（均值 559 → 545），把落入重复循环的流分开后，正常文本每一档快 5% 到 16%。详见[评测](#评测)，优化全过程见[优化报告](docs/OPTIMIZATION_REPORT.md)。
+TTFT、prefill、热启动和采样路径在每一档都更好。prefill attention 的 PV 用 int8 计算，softmax 概率量化为 u8，速度是 fp16 版本的两倍；代价是长上下文的精度略有下降，`--exact-attention` 可以换回 fp16 kernel（见[正确性](#正确性)）。上表的 decode 是 3 条流的中位数，**受混沌影响很大，不能单独看**：72 条流的总体基本打平（均值 559 → 545），把落入重复循环的流分开后，正常文本每一档快 5% 到 16%。详见[评测](#评测)，优化全过程见[优化报告](docs/OPTIMIZATION_REPORT.md)。
 
 只有 `temperature: 0` 的请求走 DSpark。模型默认的 temperature 是 0.1，走采样路径，约 260 tok/s。这和 vLLM 行为一致。
 
@@ -119,7 +119,8 @@ Go 无法编译到 GPU，现有内核又经过大量调优，所以继续用 HIP
 
 - `dspark.hip`：DSpark megakernel。一次 launch 在 GPU 上完成 draft、verify 和 commit，最多 32 轮。greedy 请求走这里。
 - `decode.hip`：decode megakernel。一次持久 launch 跑完 24 层和 LM head，一次一个 token。采样、logprobs 和 `min_tokens` 的请求走这里。
-- `prefill_attn.hip`：基于分页 int8 KV cache 的 flash attention。
+- `prefill_attn.hip`：基于分页 int8 KV cache 的 flash attention，QK 和 PV 都用 int8（softmax 概率按每 64 个 key 量化为 u8）。
+- `prefill_attn_exact.hip`：上一版 fp16 概率的 flash attention，供 `--exact-attention` 使用。
 - `gemm.hip`：prefill 所有线性层的 W8A8 矩阵乘法。
 - `ops.hip`：新写的。原生实现 vLLM 里走 torch 或 Triton JIT 的算子：embedding、RMS norm、因果卷积、Q/K norm 与 RoPE、int8 KV 写入、gate、fp16 LM head。
 
@@ -171,6 +172,7 @@ full attention 的 KV 块按 LRU 淘汰。sliding attention 块和卷积检查�
 - **doorbell 和 HDP 寄存器要用普通写入。** Go 的 `atomic.Store` 在 amd64 上是带锁的 `XCHG`。doorbell 的值是最后一个 packet 的 id，不是写指针。
 - **decode 内核曾有一处竞争，已修复。** 它在等待 grid barrier 之前就预取 `h_old`。这对其他层都安全，但第 0 层的 `h0` 正是上一阶段由 block 0 写入的，其他 block 可能读到上一个 token 的 embedding，导致整个 block 算错。在这个驱动下，它在超过 16 个 block 时出现。问题依赖时序：未修复的内核在 ROCr 下能通过同样的逐位比较测试，原因没有查明。修复只需要改 `decode.hip` 的一行。在 ROCr 下它使内核时间增加约 0.6%，33 个测评请求的前 256 个 greedy token 全部不变，所以 vLLM 与 HF 一致度较低并不是这个竞争造成的。
 - **acquire VM 之前要等一下。** 打开 render 节点会在内核里启动异步的页表更新。如果 `ACQUIRE_VM` 在约 1 毫秒内紧跟其后，这些更新会覆盖 KFD 为 trap handler 写入的页目录项。缺了这个映射，进程仍能正常运行，直到某个正在运行的 wave 被抢占，而任何进程的队列发生变化都会引发抢占：wave 取不到 trap handler，队列随之卡死。ROCr 两次调用之间的间隔足够长，所以不会遇到。这里的表现是在 vLLM 旁边启动时偶尔卡住，因为启动期间主机内存的 compaction 让 KFD 停止并重启了 vLLM 的队列。通过 debugfs 遍历页表看到该项缺失，加入 1 毫秒延迟后恢复正常。由于没有 ioctl 能等待这些更新，`kfd.Open` 会等 200 毫秒。
+- **prefill attention kernel 同样不能溢出。** 每个 block 512 线程，VGPR 上限 128，而驱动没有 scratch 内存。编写过程中有三种编译器行为造成溢出，代码里分别做了规避：barrier 之前算好的值被挪到 barrier 之后的使用处，导致所有已加载的操作数一直占着寄存器（logits 和累加器用空 `asm` 钉住）；两个分支里相同的 barrier 让编译器把两组 wave 的循环合并（两组的 barrier asm 不同）；同一对加载值的两半在两个条件下分别写出，被合并成一次写入并写错了一半（改为每个线程只加载一个 dword 到一个变量）。`kernels/build.sh` 遇到溢出或 scratch 会直接失败。
 - **不要占满显存。** 显存不足时，内核会把其他进程的缓冲区驱逐到主机内存，可能触发 OOM-killer。所以程序启动时先检查空闲显存，保留 512 MiB 余量，不足就拒绝启动，不会挤占别的进程。
 
 ## 接口
@@ -195,6 +197,7 @@ full attention 的 KV 块按 LRU 淘汰。sliding attention 块和卷积检查�
 | `--kv-tokens` | 按显存计算 | full attention KV 容量（token） |
 | `--payload` | 可执行文件本身 | 从单独的 payload 文件读取模型（开发用） |
 | `--no-draft` | 关 | greedy 请求不走 DSpark，用于对比 |
+| `--exact-attention` | 关 | prefill attention 用 fp16 softmax 概率：attention 速度减半（128k TTFT 44.4 s，默认 28.7 s），长上下文精度回到上一版 |
 
 ## 项目结构
 
@@ -226,13 +229,15 @@ docs/              优化报告
 
 | 上下文 | 输入 token | TTFT vLLM | TTFT 本项目 | prefill tok/s vLLM | prefill tok/s 本项目 | decode tok/s vLLM | decode tok/s 本项目 |
 |---|---|---|---|---|---|---|---|
-| 1k | 1024 | 0.201 s | 0.126 s | 5090 | 8135 | 974.2 | 1206.8 |
-| 8k | 8192 | 1.157 s | 1.044 s | 7082 | 7843 | 532.3 | 954.4 |
-| 32k | 32768 | 5.829 s | 5.678 s | 5622 | 5771 | 363.5 | 612.7 |
-| 64k | 65536 | 15.574 s | 15.371 s | 4208 | 4264 | 412.8 | 449.6 |
-| 128k | 126976 | 44.738 s | 44.343 s | 2838 | 2863 | 301.0 | 307.4 |
+| 1k | 1024 | 0.201 s | 0.124 s | 5090 | 8230 | 974.2 | 1206.8 |
+| 8k | 8192 | 1.157 s | 0.983 s | 7082 | 8330 | 532.3 | 954.4 |
+| 32k | 32768 | 5.829 s | 4.617 s | 5622 | 7096 | 363.5 | 612.7 |
+| 64k | 65536 | 15.574 s | 11.187 s | 4208 | 5858 | 412.8 | 449.6 |
+| 128k | 126976 | 44.738 s | 28.739 s | 2838 | 4418 | 301.0 | 307.4 |
 
-多轮对话回放，前缀缓存已预热（3 个会话，每个 3 轮），取 9 个请求的中位数：
+TTFT 和 prefill 来自 `benchmarks/lfm3-1.7b-mi50_cold.txt`，是换成 int8 PV 的 prefill attention 之后测的。decode 两列沿用之前那次（`benchmarks/lfm3-1.7b-mi50_cold_exact-attention.txt`，和 `--exact-attention` 的结果相同）：decode kernel 没有变，重新跑一次的 greedy 中位数会随下文说的重复循环"抽签"而变。attention kernel 本身在 128k prompt 上快 2.06 倍（全部层合计 32.6 s → 15.9 s），见 `benchmarks/prefill_attention.txt`。
+
+多轮对话回放，前缀缓存已预热（3 个会话，每个 3 轮），取 9 个请求的中位数，换 prefill attention 之前测：
 
 | 档位 | TTFT vLLM | TTFT 本项目 | decode tok/s vLLM | decode tok/s 本项目 |
 |---|---|---|---|---|
@@ -241,7 +246,7 @@ docs/              优化报告
 
 18 个请求的命中 token 数都和 vLLM 相同。
 
-采样路径（temperature 0.6、top_p 0.95、top_k 20，不走 DSpark）：
+采样路径（temperature 0.6、top_p 0.95、top_k 20，不走 DSpark），换 prefill attention 之前测：
 
 | 档位 | decode tok/s vLLM | decode tok/s 本项目 |
 |---|---|---|
@@ -285,7 +290,9 @@ MATH-500 和 GPQA-Diamond 各随机 20 题，thinking 开启，max_tokens 32768�
 | 确定性，DSpark，15 个评测请求 | 不同运行的前 256 个 token 全部相同 |
 | 抢占下的确定性，2000 步 decode，其间 130 个其他进程创建队列 | 逐位相同，无 GPU 故障（测于接入 DSpark 之前） |
 
-**GEMV 的 x 是 int8。** 这是唯一一处用精度换速度的决定：每轮快 8% 到 17%，代价是 KL 约为 fp16 的 6 倍（0.0028 vs 0.0004），top-1 在 119 个位置上多翻转 1 到 4 处，都发生在第一名和第二名接近的位置。fp16 回退路径需要 scratch 内存，Go 驱动没有。
+**prefill attention 的 softmax 概率是 u8。** P' = p × V scale 按每行、每 64 个 key 的 tile 相对 tile 内最大值量化，PV 用 `v_dot4` 计算。用 HF fp32 模型模拟 kernel 的量化方式，最后 192 个位置的下一 token 分布对 fp32 的 KL：16k 不变（0.00025），60k 从 0.0171 升到 0.0251（两个会话的均值；top-1 一致率 96.1% → 93.0%）。作为参照，较难的那个会话里仅 int8 KV cache 本身就有 0.031。旧 vLLM 部署按整行量化 P，导致长输出崩坏（KL 4.8）；按 tile 量化不会。`--exact-attention` 以一半的 attention 速度换回 fp16 P。细节见 `benchmarks/prefill_attention.txt`。
+
+**GEMV 的 x 是 int8。** 这是最早一处用精度换速度的决定：每轮快 8% 到 17%，代价是 KL 约为 fp16 的 6 倍（0.0028 vs 0.0004），top-1 在 119 个位置上多翻转 1 到 4 处，都发生在第一名和第二名接近的位置。fp16 回退路径需要 scratch 内存，Go 驱动没有。
 
 解读时需要注意：
 
