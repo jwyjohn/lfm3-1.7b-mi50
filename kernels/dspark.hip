@@ -1411,6 +1411,724 @@ __device__ __forceinline__ void attention_pass(const Layer& L, const float* mix,
   }
 }
 
+// ---------------------------------------------------------------- verify attention, page-tiled (v2)
+// One pass = NT <= 4 of the verified tokens over every context page plus (split 0) the fresh keys, exactly the arithmetic of
+// attention_pass: int8 Q (per 32-dim group) x int8 K in int32, fp32 scores and an exact running max, P = fp16(p x v_scale x
+// PSCALE), PV with v_dot2_f32_f16 into fp32.
+// Wave = kv head h. QK lanes (j = lane >> 4: query head 4 h + j, kk = (lane >> 1) & 7: key of an 8-key sub-tile, dh = lane & 1:
+// dims [64 dh, +64)) hold every pass token's query in registers, so the 64 lanes stay busy for any NT. PV lanes (j, col =
+// lane & 15: dims 8 col .. +7) accumulate all NT tokens of head j, so V is read once per sub-tile and reused NT times; P goes
+// through LDS (one b16 store per score, one b128 load per token and sub-tile). One iteration = one 32-key KV page, the next
+// page's K/V in registers meanwhile.
+__device__ u32x4 vraw_b128(DirectLdsResource rsrc, int voffset, int soffset, int aux) __asm("llvm.amdgcn.raw.buffer.load.v4i32");
+__device__ u32x2 vraw_b64(DirectLdsResource rsrc, int voffset, int soffset, int aux) __asm("llvm.amdgcn.raw.buffer.load.v2i32");
+__device__ float vraw_f32(DirectLdsResource rsrc, int voffset, int soffset, int aux) __asm("llvm.amdgcn.raw.buffer.load.f32");
+__device__ __forceinline__ DirectLdsResource vrsrc(const void* base) {
+  const uint64_t addr = (uint64_t)uniform64((int64_t)base);
+  return DirectLdsResource{(int32_t)(uint32_t)addr, (int32_t)(uint32_t)(addr >> 32), -1, 0x00020000};
+}
+// DPP with bound_ctrl, which lets the compiler fold the move into the VALU op that uses it (v_add_f32_dpp, v_cvt_f32_i32_dpp).
+#define V3_DPP(v, ctrl) __builtin_bit_cast(float, __builtin_amdgcn_mov_dpp(__builtin_bit_cast(int, v), ctrl, 0xf, 0xf, true))
+#define V3_DPPI(v, ctrl) __builtin_amdgcn_mov_dpp(v, ctrl, 0xf, 0xf, true)
+// dst = fp16 pair (signed byte B of a, signed byte B of b): two SDWA converts, the second keeps the low half.
+#define V3_CVT_PAIR(dst, a, b, B)                                                                                          \
+  do {                                                                                                                     \
+    asm("v_cvt_f16_i16_sdwa %0, sext(%1) dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:BYTE_" #B : "=v"(dst) : "v"(a));   \
+    asm("v_cvt_f16_i16_sdwa %0, sext(%1) dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:BYTE_" #B : "+v"(dst) : "v"(b)); \
+  } while (0)
+
+constexpr int VP = 32;                        // keys per iteration: one KV page
+constexpr int KSTR = 36;                      // K row stride (dwords): keys 4 banks apart, so the 8 lanes of a b128 phase hit 32 banks
+constexpr int VK_DW = VP * KSTR;              // K: [32 keys][128 bytes + pad]
+constexpr int VV_DW = (VP / 2) * 128;         // V: fp16 pairs of adjacent keys, [16 pairs][2 halves][16 col][4 dims]: conflict-free b128
+constexpr int VS_DW = 2 * VP;                 // k scale [32], v scale x PSCALE [32]
+constexpr int KV_SLOT = KVH * REC;
+template <int NT>
+constexpr int vwave_dw() {
+  return VK_DW + VV_DW + VS_DW + NT * 4 * VP / 2;
+}
+static_assert(4 * vwave_dw<4>() * 4 <= (int)sizeof(AttnShared), "verify attention tiles exceed the attention LDS");
+
+__device__ __forceinline__ float vadd_x1(float a) {
+  float r;
+  asm volatile("s_nop 1\n\tv_add_f32_dpp %0, %1, %1 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf" : "=v"(r) : "v"(a));
+  return r;
+}
+// a + (b of the lane ^ 1)
+__device__ __forceinline__ float vadd_x1b(float a, float b) {
+  float r;
+  asm volatile("s_nop 1\n\tv_add_f32_dpp %0, %2, %1 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf" : "=v"(r) : "v"(a), "v"(b));
+  return r;
+}
+// Max / sum over the 8 lanes of one parity in a 16-lane row (lanes 2 k + p, k = 0..7).
+__device__ __forceinline__ float max8p(float v) {
+  v = fmaxf(v, LFM3_DPP(v, 0x4e));   // quad_perm [2,3,0,1]: k ^ 1
+  v = fmaxf(v, LFM3_DPP(v, 0x124));  // row_ror 4: k - 2
+  return fmaxf(v, LFM3_DPP(v, 0x128));  // row_ror 8: k - 4
+}
+__device__ __forceinline__ float sum8p(float v) {
+  v += LFM3_DPP(v, 0x4e);
+  v += LFM3_DPP(v, 0x124);
+  return v + LFM3_DPP(v, 0x128);
+}
+
+// Whether a target layer's verify attention runs on the page partition, one call over all m tokens (attention_v2 / v3), or as passes
+// of up to 4 tokens of attention_pass (8 R-key tiles): short key ranges (sliding layers, short contexts) keep attention_pass's finer
+// partition, which spreads them over more blocks.
+__device__ __forceinline__ bool use_paged(int start, int a, int m) {
+  const int pt = a > start ? (a - 1) / VP - start / VP + 1 : 0;
+  return m <= 8 && (m <= 2 || pt >= 12);
+}
+
+__device__ __forceinline__ int verify_splits(int start, int a) {
+  const int pt = a > start ? (a - 1) / VP - start / VP + 1 : 0;
+  return max(1, min(pt, (int)gridDim.x));
+}
+
+template <int NT, typename Pre, int PF = 1>
+__device__ __forceinline__ void attention_v2(const Layer& L, float* part, AttnShared& sm, int t0_pass, int m, int a, Pre&& pre) {
+  const int win = uniform_i32((int)L.window);
+  const int kind = uniform_i32((int)L.kind);
+  const int start = attn_start(kind, win, a, 0);
+  const int p_begin = start / VP;
+  const int p_total = a > start ? (a - 1) / VP - p_begin + 1 : 0;
+  const int splits = max(1, min(p_total, (int)gridDim.x));
+  const int split = blockIdx.x;
+  if (split >= splits) {
+    pre();
+    return;
+  }
+  // The fresh keys count as the first page of the partition, so block 0 gets one context page less.
+  const int gt = p_total + 1;
+  const int g0 = p_begin + max((int)((int64_t)gt * split / splits) - 1, 0);
+  const int g1 = p_begin + max((int)((int64_t)gt * (split + 1) / splits) - 1, 0);
+  const int nctx = g1 - g0;
+  const int total = nctx + (split == 0 ? 1 : 0);
+  const int wave = __builtin_amdgcn_readfirstlane(tidx() >> 6), lane = tidx() & 63;
+  const int j = lane >> 4, c16 = lane & 15, kk = c16 >> 1, dh = c16 & 1;
+
+  const uint8_t* kv = reinterpret_cast<const uint8_t*>(uniform64(reinterpret_cast<int64_t>(L.kv)));
+  const int64_t kv_block = uniform64(L.kv_block);
+  const uint8_t* fresh_base = reinterpret_cast<const uint8_t*>(uniform64(reinterpret_cast<int64_t>(L.fresh)));
+  const __attribute__((address_space(4))) int32_t* btab =
+      (const __attribute__((address_space(4))) int32_t*)(uintptr_t)uniform64(reinterpret_cast<int64_t>(L.block_table));
+
+  // Loads of one page. K: lane l owns 16-byte piece l & 7 of key (l >> 3) + 8 c. V: dims 8 (l & 15) .. +7 of keys 2 (l >> 4) + 8 c
+  // and the next one. Scales: lane l the k (l < 32) or v (l >= 32) scale of key l & 31.
+  const uint32_t off_k = (uint32_t)((lane >> 3) * KV_SLOT + wave * REC + 16 * (lane & 7));
+  const uint32_t off_v = (uint32_t)(2 * (lane >> 4) * KV_SLOT + wave * REC + 132 + 8 * c16);
+  const uint32_t off_s = (uint32_t)((lane & 31) * KV_SLOT + wave * REC + (lane < 32 ? 128 : 260));
+  const float s_mul = lane < 32 ? 1.f : PSCALE;
+  u32x4 nk[PF][4];
+  u32x2 nv[PF][4][2];
+  float ns[PF];
+  // Buffer loads: the page offset sits in soffset (SGPR), the lane offset in voffset: no per-load address math.
+  const DirectLdsResource rs_kv = vrsrc(kv), rs_fresh = vrsrc(fresh_base);
+  auto issue = [&](int b, bool fresh, int soff) {
+    const DirectLdsResource r = fresh ? rs_fresh : rs_kv;
+#pragma unroll
+    for (int c = 0; c < 4; ++c) {
+      nk[b][c] = vraw_b128(r, (int)off_k, soff + c * 8 * KV_SLOT, 0);
+      nv[b][c][0] = vraw_b64(r, (int)off_v, soff + c * 8 * KV_SLOT, 0);
+      nv[b][c][1] = vraw_b64(r, (int)off_v, soff + c * 8 * KV_SLOT + KV_SLOT, 0);
+    }
+    ns[b] = vraw_f32(r, (int)off_s, soff, 0);
+  };
+
+  uint32_t* W = reinterpret_cast<uint32_t*>(&sm) + wave * vwave_dw<NT>();
+  uint32_t* WK = W;
+  uint32_t* WV = W + VK_DW;
+  float* WS = reinterpret_cast<float*>(W + VK_DW + VV_DW);
+  __half* WP = reinterpret_cast<__half*>(W + VK_DW + VV_DW + VS_DW);
+  auto stage = [&](int b) {
+#pragma unroll
+    for (int c = 0; c < 4; ++c) {
+      *reinterpret_cast<u32x4*>(WK + ((lane >> 3) + 8 * c) * KSTR + 4 * (lane & 7)) = nk[b][c];
+      // V as fp16 pairs of adjacent keys: one SDWA convert per half (signed byte -> fp16).
+      uint32_t vw[8];
+      V3_CVT_PAIR(vw[0], nv[b][c][0].x, nv[b][c][1].x, 0);
+      V3_CVT_PAIR(vw[1], nv[b][c][0].x, nv[b][c][1].x, 1);
+      V3_CVT_PAIR(vw[2], nv[b][c][0].x, nv[b][c][1].x, 2);
+      V3_CVT_PAIR(vw[3], nv[b][c][0].x, nv[b][c][1].x, 3);
+      V3_CVT_PAIR(vw[4], nv[b][c][0].y, nv[b][c][1].y, 0);
+      V3_CVT_PAIR(vw[5], nv[b][c][0].y, nv[b][c][1].y, 1);
+      V3_CVT_PAIR(vw[6], nv[b][c][0].y, nv[b][c][1].y, 2);
+      V3_CVT_PAIR(vw[7], nv[b][c][0].y, nv[b][c][1].y, 3);
+      uint32_t* vo = WV + (4 * c + (lane >> 4)) * 128 + 4 * c16;
+      *reinterpret_cast<u32x4*>(vo) = u32x4{vw[0], vw[1], vw[2], vw[3]};
+      *reinterpret_cast<u32x4*>(vo + 64) = u32x4{vw[4], vw[5], vw[6], vw[7]};
+    }
+    WS[lane] = ns[b] * s_mul;
+  };
+
+  const int kvb = uniform_i32((int)L.kv_block);
+  auto blk_of = [&](int q) { return uniform_i32(btab[g0 + min(q, max(nctx - 1, 0))]); };
+  auto issue_page = [&](int b, int q, int blk) { issue(b, q >= nctx, q >= nctx ? 0 : blk * kvb); };
+  // A fresh page (split 0 without context pages) holds K/V that other blocks wrote in the phase just before: after the barrier.
+  if (nctx >= PF) {
+#pragma unroll
+    for (int b = 0; b < PF; ++b) issue_page(b, b, blk_of(b));
+  }
+  pre();
+  if (nctx < PF) {
+#pragma unroll
+    for (int b = 0; b < PF; ++b) issue_page(b, b, blk_of(b));
+  }
+
+  // This lane's query: dims [64 dh, +64) of head 4 wave + j for every pass token (int8, 16 dwords) and its two group scales.
+  const float qk_scale = 0.08838834764831845f * LOG2E;
+  // Even NT: the two lanes of a key split the tokens after the QK sum (lane dh owns tokens [H dh, H dh + H)); lane dh = 1 holds
+  // its queries rotated by H, so one DPP add per owned token completes the score (the other half comes from register r + H).
+  constexpr bool DEDUP = NT % 2 == 0;
+  constexpr int H = DEDUP ? NT / 2 : NT;
+  auto qtok = [&](int r) { return DEDUP && dh ? (r + H) % NT : r; };  // token held in query register r
+  auto otok = [&](int r) { return DEDUP ? r + H * dh : r; };           // token of owned row r
+  uint32_t qreg[NT][16];
+  float qsc[NT][2];
+  {
+    const int8_t* qg = reinterpret_cast<const int8_t*>(part) + (size_t)(WS_Q - WS_PART) * 4;
+    const float* qsg = reinterpret_cast<const float*>(qg + (size_t)MT * QH * D);
+#pragma unroll
+    for (int t = 0; t < NT; ++t) {
+      const int tok = t0_pass + qtok(t);
+      const u32x4* src = reinterpret_cast<const u32x4*>(qg + ((size_t)tok * QH + wave * 4 + j) * D + 64 * dh);
+#pragma unroll
+      for (int r = 0; r < 4; ++r) {
+        const u32x4 q = gload(src + r);
+        qreg[t][4 * r] = q.x;
+        qreg[t][4 * r + 1] = q.y;
+        qreg[t][4 * r + 2] = q.z;
+        qreg[t][4 * r + 3] = q.w;
+      }
+      qsc[t][0] = gload(qsg + ((size_t)tok * QH + wave * 4 + j) * 4 + 2 * dh) * qk_scale;
+      qsc[t][1] = gload(qsg + ((size_t)tok * QH + wave * 4 + j) * 4 + 2 * dh + 1) * qk_scale;
+    }
+  }
+
+  // The query loads (and with them the first pages) complete here, not at their first use inside the loop: a pending load at
+  // the loop entry would make every iteration wait for the newest page.
+  __builtin_amdgcn_s_waitcnt(0x0f70);  // vmcnt(0)
+  float m_run[H], l_run[H], acc[NT][8];
+#pragma unroll
+  for (int r = 0; r < H; ++r) {
+    m_run[r] = -1e30f;  // not -inf: an invalid key's score is -inf, and -inf - -inf would be NaN
+    l_run[r] = 0.f;
+  }
+#pragma unroll
+  for (int t = 0; t < NT; ++t)
+#pragma unroll
+    for (int d = 0; d < 8; ++d) acc[t][d] = 0.f;
+  // Pages whose 32 keys are valid for every pass token: no per-key checks.
+  const int last_tok = t0_pass + NT - 1;
+  const int kmin_all = (win != 0) ? max(start, a + last_tok - win + 1) : start;
+  const int it_a = (kmin_all + VP - 1) / VP - g0;   // first page fully at or above kmin_all
+  const int it_b = min(a / VP - g0, nctx);         // pages below this one end before a
+
+  // Block id of the page PF iterations ahead, loaded (scalar) one iteration before its use.
+  int blk_n = blk_of(PF);
+  auto body = [&](int it, int b) {
+    stage(b);
+    issue_page(b, it + PF, blk_n);
+    blk_n = blk_of(it + PF + 1);
+    __builtin_amdgcn_sched_barrier(0);
+    const bool edge = it < it_a || it >= it_b;
+    // Per sub-tile: QK (the K half of one 32-dim group pair in flight while the other computes), the running max, P to LDS.
+    uint32_t ka[8], kb[8];
+    auto khalf = [&](uint32_t (&dst)[8], int c, int h) {
+      const u32x4* src = reinterpret_cast<const u32x4*>(WK + (8 * c + kk) * KSTR + 16 * dh + 8 * h);
+      const u32x4 x = src[0], y = src[1];
+      dst[0] = x.x; dst[1] = x.y; dst[2] = x.z; dst[3] = x.w;
+      dst[4] = y.x; dst[5] = y.y; dst[6] = y.z; dst[7] = y.w;
+    };
+    khalf(ka, 0, 0);
+    khalf(kb, 0, 1);
+    // The whole page's scores first: a running max that moves inside the page must also rescale P already written.
+    float sc[4][H], vsv[4];
+#pragma unroll
+    for (int c = 0; c < 4; ++c) {
+      const float ks = WS[8 * c + kk];
+      vsv[c] = WS[VP + 8 * c + kk];
+      __builtin_amdgcn_sched_barrier(0);
+      int ai0[NT], ai1[NT];
+#pragma unroll
+      for (int t = 0; t < NT; ++t) {
+        ai0[t] = 0;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) ai0[t] = __builtin_amdgcn_sdot4(ka[w], qreg[t][w], ai0[t], false);
+      }
+      if (c + 1 < 4) khalf(ka, c + 1, 0);
+      __builtin_amdgcn_sched_barrier(0);
+#pragma unroll
+      for (int t = 0; t < NT; ++t) {
+        ai1[t] = 0;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) ai1[t] = __builtin_amdgcn_sdot4(kb[w], qreg[t][8 + w], ai1[t], false);
+      }
+      if (c + 1 < 4) khalf(kb, c + 1, 1);
+      __builtin_amdgcn_sched_barrier(0);
+      float sv[NT];
+#pragma unroll
+      for (int t = 0; t < NT; ++t) {
+        sv[t] = fmaf((float)ai0[t], qsc[t][0], 0.f);
+        sv[t] = fmaf((float)ai1[t], qsc[t][1], sv[t]);
+      }
+#pragma unroll
+      for (int r = 0; r < H; ++r) sc[c][r] = (DEDUP ? vadd_x1b(sv[r], sv[r + H]) : vadd_x1(sv[r])) * ks;
+    }
+    if (__builtin_expect(edge, 0)) {
+      const bool fresh = it >= nctx;
+#pragma unroll
+      for (int c = 0; c < 4; ++c)
+#pragma unroll
+        for (int r = 0; r < H; ++r) {
+          const int tok = t0_pass + otok(r), qpos = a + tok, fk = 8 * c + kk;
+          bool valid;
+          if (fresh) valid = fk < m && fk <= tok;
+          else {
+            const int kpos = (g0 + it) * VP + fk;
+            valid = kpos >= start && kpos < a && (win == 0 || kpos > qpos - win);
+          }
+          sc[c][r] = valid ? sc[c][r] : -INFINITY;
+        }
+    }
+    // Running max: only when some lane's score beats its row's max (uniform branch: the row max needs every lane).
+    float mx[H];
+    uint64_t beat = 0;
+#pragma unroll
+    for (int r = 0; r < H; ++r) {
+      mx[r] = fmaxf(fmaxf(sc[0][r], sc[1][r]), fmaxf(sc[2][r], sc[3][r]));
+      beat |= __builtin_amdgcn_uicmp(mx[r] > m_run[r] ? 1u : 0u, 0u, 33);
+    }
+    if (__builtin_expect(beat != 0, 0)) {
+      float corr[H];
+#pragma unroll
+      for (int r = 0; r < H; ++r) {
+        const float mn = fmaxf(m_run[r], DEDUP ? max8p(mx[r]) : row_max16(mx[r]));
+        corr[r] = hw_exp2(m_run[r] - mn);
+        m_run[r] = mn;
+        l_run[r] *= corr[r];
+      }
+      // PV lanes hold every token of head j: token t's factor comes from a lane of its owner parity in the same quad.
+#pragma unroll
+      for (int t = 0; t < NT; ++t) {
+        float ct = corr[t % H];
+        if (DEDUP) ct = t < H ? LFM3_DPP(ct, 0x00) : LFM3_DPP(ct, 0x55);
+#pragma unroll
+        for (int d = 0; d < 8; ++d) acc[t][d] *= ct;
+      }
+    }
+    // All exponents back to back (quarter-rate ops, independent), then their uses: interleaved, every use would wait for its exp.
+#pragma unroll
+    for (int c = 0; c < 4; ++c)
+#pragma unroll
+      for (int r = 0; r < H; ++r) sc[c][r] = sc[c][r] - m_run[r];
+    __builtin_amdgcn_sched_barrier(0);
+#pragma unroll
+    for (int c = 0; c < 4; ++c)
+#pragma unroll
+      for (int r = 0; r < H; ++r) sc[c][r] = hw_exp2(sc[c][r]);
+    __builtin_amdgcn_sched_barrier(0);
+#pragma unroll
+    for (int c = 0; c < 4; ++c)
+#pragma unroll
+      for (int r = 0; r < H; ++r) {
+        l_run[r] += sc[c][r];
+        WP[(otok(r) * 4 + j) * VP + 8 * c + kk] = __float2half_rn(sc[c][r] * vsv[c]);
+      }
+    __builtin_amdgcn_sched_barrier(0);
+    // PV: dims 8 col .. +7 of head 4 wave + j for every token over the 16 key pairs. The next pair's V and the next P half
+    // are on their way from LDS during each step (one wave's LDS ops complete in order: P is read after it was written).
+    uint32_t pc[NT][2], pn[NT][2];
+    constexpr int VDIST = 1, VB = VDIST + 1;
+    u32x4 vb[VB][2];
+    auto pload = [&](uint32_t (&dst)[NT][2], int c, int h) {
+#pragma unroll
+      for (int t = 0; t < NT; ++t) {
+        const u32x2 x = *reinterpret_cast<const u32x2*>(reinterpret_cast<const uint32_t*>(WP) + (t * 4 + j) * (VP / 2) + 4 * c + 2 * h);
+        dst[t][0] = x.x;
+        dst[t][1] = x.y;
+      }
+    };
+    auto vload = [&](int s, int b) {
+      const uint32_t* vp = WV + s * 128 + 4 * c16;
+      vb[b][0] = *reinterpret_cast<const u32x4*>(vp);
+      vb[b][1] = *reinterpret_cast<const u32x4*>(vp + 64);
+    };
+    pload(pc, 0, 0);
+#pragma unroll
+    for (int s = 0; s < VDIST; ++s) vload(s, s % VB);
+#pragma unroll
+    for (int s = 0; s < 16; ++s) {
+      if (s + VDIST < 16) vload(s + VDIST, (s + VDIST) % VB);
+      // pairs (0, 1) of a sub-tile use pc, (2, 3) pn; each half is requested one step before its first use
+      if ((s & 1) == 0 && s + 1 < 16) {
+        if ((s & 3) == 0) pload(pn, s >> 2, 1);
+        else pload(pc, (s >> 2) + 1, 0);
+      }
+      __builtin_amdgcn_sched_barrier(0);
+      const uint32_t vd[8] = {vb[s % VB][0].x, vb[s % VB][0].y, vb[s % VB][0].z, vb[s % VB][0].w,
+                              vb[s % VB][1].x, vb[s % VB][1].y, vb[s % VB][1].z, vb[s % VB][1].w};
+#pragma unroll
+      for (int t = 0; t < NT; ++t) {
+        const half2_t pp = as_h2((s & 2) ? pn[t][s & 1] : pc[t][s & 1]);
+#pragma unroll
+        for (int d = 0; d < 8; ++d) acc[t][d] = __builtin_amdgcn_fdot2(as_h2(vd[d]), pp, acc[t][d], false);
+      }
+      __builtin_amdgcn_sched_barrier(0);
+    }
+  };
+  for (int it = 0; it < total; it += PF) {
+    body(it, 0);
+    if (PF > 1 && it + 1 < total) body(it + 1, 1 % PF);
+  }
+
+  // Partials: lane (j, col) writes dims 8 col .. +7 of every token's head 4 wave + j; col 0 adds m and l (both lanes of a key
+  // summed the same p, hence the half).
+#pragma unroll
+  for (int t = 0; t < NT; ++t) {
+    const int tok = t0_pass + t;
+    float* dst = part + ((size_t)(tok * QH + wave * 4 + j) * SPLITS + split) * (D + 2);
+    float4* d4 = reinterpret_cast<float4*>(dst + 8 * c16);
+    d4[0] = make_float4(acc[t][0], acc[t][1], acc[t][2], acc[t][3]) * (1.f / PSCALE);
+    d4[1] = make_float4(acc[t][4], acc[t][5], acc[t][6], acc[t][7]) * (1.f / PSCALE);
+  }
+  // m and l of the owned rows: lane (j, kk = 0, dh) for dedup (each p summed once), lane col 0 otherwise (both lanes of a key
+  // summed the same p, hence the half).
+#pragma unroll
+  for (int r = 0; r < H; ++r) {
+    const float lt = DEDUP ? sum8p(l_run[r]) : 0.5f * row_sum16(l_run[r]);
+    const int tok = t0_pass + otok(r);
+    float* dst = part + ((size_t)(tok * QH + wave * 4 + j) * SPLITS + split) * (D + 2);
+    if (DEDUP ? c16 < 2 : c16 == 0) {
+      dst[D] = m_run[r];
+      dst[D + 1] = lt;
+    }
+  }
+}
+
+// ---------------------------------------------------------------- verify attention, one K/V pass for up to 8 tokens (v3)
+// attention_v2's partition, page loads, staging and partials, but every verified token in one pass, so K/V cross the memory bus
+// once per layer whatever M is. QK lanes: j = lane >> 4 (query head 4 wave + j), kk = (lane >> 2) & 3 (key 4 c + kk of sub-tile c,
+// 8 sub-tiles per page), dq = lane & 3 (dims [32 dq, +32): one query scale group). A lane keeps 8 dwords of query per token, so 8
+// tokens take 64 VGPRs; register r holds token (r & ~3) | ((r & 3) ^ dq), which lets the 4 lanes of a key reduce-scatter their
+// partial scores in 3 DPP ops per 4 tokens: lane dq then owns tokens dq and 4 + dq of its key. PV lanes (j, col = lane & 15)
+// accumulate dims 8 col .. +7 of every token of head j as in v2; P comes through LDS in the K tile (K is dead by then).
+template <int NT>
+constexpr int v3_pj(int j) {  // P tile offset of head j (dwords): the 32 dwords of one P store land in 32 banks
+  return NT == 8 ? j * 128 + (j & 1) * 4 + (j >> 1) * 16 : j * 72;
+}
+constexpr int V3_DW = VK_DW + VV_DW + VS_DW;
+static_assert(4 * V3_DW * 4 <= (int)sizeof(AttnShared), "verify attention v3 tiles exceed the attention LDS");
+static_assert(v3_pj<8>(3) + 16 * 8 <= VK_DW && v3_pj<4>(3) + 16 * 4 <= VK_DW, "P tile exceeds the K tile");
+
+template <int NT, typename Pre>
+__device__ __forceinline__ void attention_v3(const Layer& L, float* part, AttnShared& sm, int m, int a, Pre&& pre) {
+  static_assert(NT == 4 || NT == 8, "v3 runs 4 or 8 token slots");
+  constexpr int G = NT / 4;  // owned tokens per lane and key
+  const int win = uniform_i32((int)L.window);
+  const int kind = uniform_i32((int)L.kind);
+  const int start = attn_start(kind, win, a, 0);
+  const int p_begin = start / VP;
+  const int p_total = a > start ? (a - 1) / VP - p_begin + 1 : 0;
+  const int splits = max(1, min(p_total, (int)gridDim.x));
+  const int split = blockIdx.x;
+  if (split >= splits) {
+    pre();
+    return;
+  }
+  const int gt = p_total + 1;
+  const int g0 = p_begin + max((int)((int64_t)gt * split / splits) - 1, 0);
+  const int g1 = p_begin + max((int)((int64_t)gt * (split + 1) / splits) - 1, 0);
+  const int nctx = g1 - g0;
+  const int total = nctx + (split == 0 ? 1 : 0);
+  const int wave = __builtin_amdgcn_readfirstlane(tidx() >> 6), lane = tidx() & 63;
+  const int j = lane >> 4, c16 = lane & 15, kk = (lane >> 2) & 3, dq = lane & 3;
+
+  const uint8_t* kv = reinterpret_cast<const uint8_t*>(uniform64(reinterpret_cast<int64_t>(L.kv)));
+  const uint8_t* fresh_base = reinterpret_cast<const uint8_t*>(uniform64(reinterpret_cast<int64_t>(L.fresh)));
+  const int32_t* btab = reinterpret_cast<const int32_t*>(uniform64(reinterpret_cast<int64_t>(L.block_table)));
+
+  const uint32_t off_k = (uint32_t)((lane >> 3) * KV_SLOT + wave * REC + 16 * (lane & 7));
+  const uint32_t off_v = (uint32_t)(2 * (lane >> 4) * KV_SLOT + wave * REC + 132 + 8 * c16);
+  const uint32_t off_s = (uint32_t)((lane & 31) * KV_SLOT + wave * REC + (lane < 32 ? 128 : 260));
+  const float s_mul = lane < 32 ? 1.f : PSCALE;
+  u32x4 nk[4];
+  u32x2 nv[4][2];
+  float ns;
+  const DirectLdsResource rs_kv = vrsrc(kv), rs_fresh = vrsrc(fresh_base);
+  auto issue = [&](bool fresh, int soff) {
+    const DirectLdsResource r = fresh ? rs_fresh : rs_kv;
+#pragma unroll
+    for (int c = 0; c < 4; ++c) {
+      nk[c] = vraw_b128(r, (int)off_k, soff + c * 8 * KV_SLOT, 0);
+      nv[c][0] = vraw_b64(r, (int)off_v, soff + c * 8 * KV_SLOT, 0);
+      nv[c][1] = vraw_b64(r, (int)off_v, soff + c * 8 * KV_SLOT + KV_SLOT, 0);
+    }
+    ns = vraw_f32(r, (int)off_s, soff, 0);
+  };
+
+  uint32_t* W = reinterpret_cast<uint32_t*>(&sm) + wave * V3_DW;
+  uint32_t* WK = W;
+  uint32_t* WV = W + VK_DW;
+  float* WS = reinterpret_cast<float*>(W + VK_DW + VV_DW);
+  __half* WP = reinterpret_cast<__half*>(W);
+  // K and the scales first: the QK's first reads queue behind these stores only, and the V conversion covers their latency.
+  auto stage_k = [&]() {
+#pragma unroll
+    for (int c = 0; c < 4; ++c) *reinterpret_cast<u32x4*>(WK + ((lane >> 3) + 8 * c) * KSTR + 4 * (lane & 7)) = nk[c];
+    // Scales by (kk, c) of their key 4 c + kk, so a QK lane finds its 8 keys' scales together: k at [8 kk + c], v at [32 + 8 kk + c].
+    const int key = lane & 31;
+    WS[(lane & 32) + 8 * (key & 3) + (key >> 2)] = ns * s_mul;
+  };
+  // V as fp16 pairs of adjacent keys: one SDWA convert per half (signed byte -> fp16), 16 per 8 keys and 8 dims.
+  auto stage_v = [&]() {
+#pragma unroll
+    for (int c = 0; c < 4; ++c) {
+      uint32_t vw[8];
+      V3_CVT_PAIR(vw[0], nv[c][0].x, nv[c][1].x, 0);
+      V3_CVT_PAIR(vw[1], nv[c][0].x, nv[c][1].x, 1);
+      V3_CVT_PAIR(vw[2], nv[c][0].x, nv[c][1].x, 2);
+      V3_CVT_PAIR(vw[3], nv[c][0].x, nv[c][1].x, 3);
+      V3_CVT_PAIR(vw[4], nv[c][0].y, nv[c][1].y, 0);
+      V3_CVT_PAIR(vw[5], nv[c][0].y, nv[c][1].y, 1);
+      V3_CVT_PAIR(vw[6], nv[c][0].y, nv[c][1].y, 2);
+      V3_CVT_PAIR(vw[7], nv[c][0].y, nv[c][1].y, 3);
+      uint32_t* vo = WV + (4 * c + (lane >> 4)) * 128 + 4 * c16;
+      *reinterpret_cast<u32x4*>(vo) = u32x4{vw[0], vw[1], vw[2], vw[3]};
+      *reinterpret_cast<u32x4*>(vo + 64) = u32x4{vw[4], vw[5], vw[6], vw[7]};
+    }
+  };
+
+  // Block ids of this split's pages, one per lane, read with v_readlane: no scalar load (and its lgkmcnt(0), which would also
+  // drain the LDS stores) inside the loop. A split has at most 69 pages at the 131072-token limit (4097 pages over 60 blocks).
+  const int kvb = uniform_i32((int)L.kv_block);
+  const int qmax = max(nctx - 1, 0);
+  const int bt0 = gload(btab + g0 + min(lane, qmax)), bt1 = gload(btab + g0 + min(64 + lane, qmax));
+  auto blk_of = [&](int q) {
+    q = min(q, min(qmax, 127));
+    return q < 64 ? __builtin_amdgcn_readlane(bt0, q) : __builtin_amdgcn_readlane(bt1, q - 64);
+  };
+  auto issue_page = [&](int q) { issue(q >= nctx, q >= nctx ? 0 : blk_of(q) * kvb); };
+
+  // Query dims [32 dq, +32) of head 4 wave + j, register r = token (r & ~3) | ((r & 3) ^ dq); tokens from m on get a zero scale.
+  const float qk_scale = 0.08838834764831845f * LOG2E;
+  auto qtok = [&](int r) { return (r & ~3) | ((r & 3) ^ dq); };
+  uint32_t qreg[NT][8];
+  float qsc[NT];
+  {
+    const int8_t* qg = reinterpret_cast<const int8_t*>(part) + (size_t)(WS_Q - WS_PART) * 4;
+    const float* qsg = reinterpret_cast<const float*>(qg + (size_t)MT * QH * D);
+    // The block ids arrive first (the vmcnt below), then the first page goes out while the query loads.
+    // (A fresh page, split 0 without context pages, holds K/V other blocks wrote in the phase just before: after the barrier.)
+    __builtin_amdgcn_s_waitcnt(0x0f70);
+    if (nctx > 0) issue_page(0);
+    pre();
+    if (nctx == 0) issue_page(0);
+#pragma unroll
+    for (int r = 0; r < NT; ++r) {
+      const int tok = qtok(r);
+      const u32x4* src = reinterpret_cast<const u32x4*>(qg + ((size_t)tok * QH + wave * 4 + j) * D + 32 * dq);
+      const u32x4 q0 = gload(src), q1 = gload(src + 1);
+      qreg[r][0] = q0.x; qreg[r][1] = q0.y; qreg[r][2] = q0.z; qreg[r][3] = q0.w;
+      qreg[r][4] = q1.x; qreg[r][5] = q1.y; qreg[r][6] = q1.z; qreg[r][7] = q1.w;
+      const float s = gload(qsg + ((size_t)tok * QH + wave * 4 + j) * 4 + dq) * qk_scale;
+      qsc[r] = tok < m ? s : 0.f;
+    }
+  }
+  __builtin_amdgcn_s_waitcnt(0x0f70);  // vmcnt(0): see attention_v2
+  // The scale of the partner lane (dq ^ 1) for odd registers: the first reduce step is one v_fmac_f32_dpp per token pair.
+  float qsp[NT / 2];
+#pragma unroll
+  for (int r = 0; r < NT / 2; ++r) qsp[r] = V3_DPP(qsc[2 * r + 1], 0xB1);
+
+  float m_run[G], l_run[G], acc[NT][8];
+#pragma unroll
+  for (int g = 0; g < G; ++g) {
+    m_run[g] = -1e30f;
+    l_run[g] = 0.f;
+  }
+#pragma unroll
+  for (int t = 0; t < NT; ++t)
+#pragma unroll
+    for (int d = 0; d < 8; ++d) acc[t][d] = 0.f;
+  const int last_tok = min(m, NT) - 1;
+  const int kmin_all = (win != 0) ? max(start, a + last_tok - win + 1) : start;
+  const int it_a = (kmin_all + VP - 1) / VP - g0;
+  const int it_b = min(a / VP - g0, nctx);
+  const uint32_t* WPw = reinterpret_cast<const uint32_t*>(W) + v3_pj<NT>(j);
+
+  for (int it = 0; it < total; ++it) {
+    uint32_t kb[2][8];
+    float ksc[2], vsc[8];
+    auto kload = [&](int c, int b) {
+      const u32x4* src = reinterpret_cast<const u32x4*>(WK + (4 * c + kk) * KSTR + 8 * dq);
+      const u32x4 x = src[0], y = src[1];
+      kb[b][0] = x.x; kb[b][1] = x.y; kb[b][2] = x.z; kb[b][3] = x.w;
+      kb[b][4] = y.x; kb[b][5] = y.y; kb[b][6] = y.z; kb[b][7] = y.w;
+      ksc[b] = WS[8 * kk + c];
+      vsc[c] = WS[32 + 8 * kk + c];
+    };
+    stage_k();
+    kload(0, 0);
+    stage_v();
+    issue_page(it + 1);
+    __builtin_amdgcn_sched_barrier(0);
+    const bool edge = it < it_a || it >= it_b;
+    // QK over the 8 sub-tiles: this lane's 32 dims of key 4 c + kk against every token, then the reduce-scatter.
+    float sc[8][G];
+#pragma unroll
+    for (int c = 0; c < 8; ++c) {
+      if (c + 1 < 8) kload(c + 1, (c + 1) & 1);
+      __builtin_amdgcn_sched_barrier(0);
+      int si[NT];
+#pragma unroll
+      for (int r = 0; r < NT; ++r) {
+        si[r] = 0;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) si[r] = __builtin_amdgcn_sdot4(kb[c & 1][w], qreg[r][w], si[r], false);
+      }
+#pragma unroll
+      for (int g = 0; g < G; ++g) {
+        // Token pair sums over lanes dq, dq ^ 1 (the partner's integer sum converts on the way in: v_cvt_f32_i32_dpp), then
+        // over dq ^ 2 (v_add_f32_dpp).
+        const float s0 = fmaf((float)V3_DPPI(si[4 * g + 1], 0xB1), qsp[2 * g], (float)si[4 * g] * qsc[4 * g]);
+        const float s1 = fmaf((float)V3_DPPI(si[4 * g + 3], 0xB1), qsp[2 * g + 1], (float)si[4 * g + 2] * qsc[4 * g + 2]);
+        sc[c][g] = (s0 + V3_DPP(s1, 0x4E)) * ksc[c & 1];
+      }
+      __builtin_amdgcn_sched_barrier(0);
+    }
+    if (__builtin_expect(edge, 0)) {
+      const bool fresh = it >= nctx;
+#pragma unroll
+      for (int c = 0; c < 8; ++c)
+#pragma unroll
+        for (int g = 0; g < G; ++g) {
+          const int tok = 4 * g + dq, qpos = a + tok, fk = 4 * c + kk;
+          bool valid;
+          if (fresh) valid = fk < m && fk <= tok;
+          else {
+            const int kpos = (g0 + it) * VP + fk;
+            valid = kpos >= start && kpos < a && (win == 0 || kpos > qpos - win);
+          }
+          sc[c][g] = valid ? sc[c][g] : -INFINITY;
+        }
+    }
+    float mx[G];
+    uint64_t beat = 0;
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+      mx[g] = fmaxf(fmaxf(fmaxf(sc[0][g], sc[1][g]), fmaxf(sc[2][g], sc[3][g])), fmaxf(fmaxf(sc[4][g], sc[5][g]), fmaxf(sc[6][g], sc[7][g])));
+      beat |= __builtin_amdgcn_uicmp(mx[g] > m_run[g] ? 1u : 0u, 0u, 33);
+    }
+    if (__builtin_expect(beat != 0, 0)) {
+      float corr[G];
+#pragma unroll
+      for (int g = 0; g < G; ++g) {
+        float r = fmaxf(mx[g], LFM3_DPP(mx[g], 0x124));  // row_ror 4: kk + 1
+        r = fmaxf(r, LFM3_DPP(r, 0x128));                // row_ror 8: kk + 2
+        const float mn = fmaxf(m_run[g], r);
+        corr[g] = hw_exp2(m_run[g] - mn);
+        m_run[g] = mn;
+        l_run[g] *= corr[g];
+      }
+      // PV lanes hold every token of head j: token t's factor is in lane dq = t & 3 of every quad of the row.
+#pragma unroll
+      for (int t = 0; t < NT; ++t) {
+        const float cg = corr[t >> 2];
+        const float ct = (t & 3) == 0 ? LFM3_DPP(cg, 0x00) : (t & 3) == 1 ? LFM3_DPP(cg, 0x55) : (t & 3) == 2 ? LFM3_DPP(cg, 0xAA) : LFM3_DPP(cg, 0xFF);
+#pragma unroll
+        for (int d = 0; d < 8; ++d) acc[t][d] *= ct;
+      }
+    }
+    // PV operands, one key pair ahead: V of the pair (8 dims) and P of every token (NT dwords). V of the first pairs is in LDS
+    // since the staging, so it goes out before the P stores and its latency hides behind the exponentials.
+    constexpr int VB = 2;
+    u32x4 vb[VB][2];
+    uint32_t pb[VB][NT];
+    auto vload = [&](int s, int b) {
+      const uint32_t* vp = WV + s * 128 + 4 * c16;
+      vb[b][0] = *reinterpret_cast<const u32x4*>(vp);
+      vb[b][1] = *reinterpret_cast<const u32x4*>(vp + 64);
+    };
+    auto pload = [&](int s, int b) {
+#pragma unroll
+      for (int q = 0; q < NT / 4; ++q) {
+        const u32x4 x = *reinterpret_cast<const u32x4*>(WPw + s * NT + 4 * q);
+        pb[b][4 * q] = x.x; pb[b][4 * q + 1] = x.y; pb[b][4 * q + 2] = x.z; pb[b][4 * q + 3] = x.w;
+      }
+    };
+    vload(0, 0);
+#pragma unroll
+    for (int c = 0; c < 8; ++c)
+#pragma unroll
+      for (int g = 0; g < G; ++g) sc[c][g] = sc[c][g] - m_run[g];
+    __builtin_amdgcn_sched_barrier(0);
+#pragma unroll
+    for (int c = 0; c < 8; ++c)
+#pragma unroll
+      for (int g = 0; g < G; ++g) sc[c][g] = hw_exp2(sc[c][g]);
+    __builtin_amdgcn_sched_barrier(0);
+    // P (fp16, x v scale x PSCALE) of token 4 g + dq, key 4 c + kk: half (kk & 1) of dword pair (2 c + (kk >> 1)) of token row.
+#pragma unroll
+    for (int c = 0; c < 8; ++c)
+#pragma unroll
+      for (int g = 0; g < G; ++g) {
+        l_run[g] += sc[c][g];
+        WP[2 * (v3_pj<NT>(j) + (2 * c + (kk >> 1)) * NT + 4 * g + dq) + (kk & 1)] = __float2half_rn(sc[c][g] * vsc[c]);
+      }
+    pload(0, 0);
+    __builtin_amdgcn_sched_barrier(0);
+#pragma unroll
+    for (int s = 0; s < 16; ++s) {
+      if (s + 1 < 16) {
+        vload(s + 1, (s + 1) % VB);
+        pload(s + 1, (s + 1) % VB);
+      }
+      __builtin_amdgcn_sched_barrier(0);
+      const uint32_t vd[8] = {vb[s % VB][0].x, vb[s % VB][0].y, vb[s % VB][0].z, vb[s % VB][0].w,
+                              vb[s % VB][1].x, vb[s % VB][1].y, vb[s % VB][1].z, vb[s % VB][1].w};
+#pragma unroll
+      for (int t = 0; t < NT; ++t) {
+        const half2_t pp = as_h2(pb[s % VB][t]);
+#pragma unroll
+        for (int d = 0; d < 8; ++d) acc[t][d] = __builtin_amdgcn_fdot2(as_h2(vd[d]), pp, acc[t][d], false);
+      }
+      __builtin_amdgcn_sched_barrier(0);
+    }
+  }
+
+  // Partials of tokens < m: lane (j, col) writes dims 8 col .. +7 of head 4 wave + j; the owner lanes (kk = 0) add m and l.
+#pragma unroll
+  for (int t = 0; t < NT; ++t) {
+    if (t >= m) break;
+    float* dst = part + ((size_t)(t * QH + wave * 4 + j) * SPLITS + split) * (D + 2);
+    float4* d4 = reinterpret_cast<float4*>(dst + 8 * c16);
+    d4[0] = make_float4(acc[t][0], acc[t][1], acc[t][2], acc[t][3]) * (1.f / PSCALE);
+    d4[1] = make_float4(acc[t][4], acc[t][5], acc[t][6], acc[t][7]) * (1.f / PSCALE);
+  }
+#pragma unroll
+  for (int g = 0; g < G; ++g) {
+    float lt = l_run[g] + LFM3_DPP(l_run[g], 0x124);
+    lt = lt + LFM3_DPP(lt, 0x128);
+    const int tok = 4 * g + dq;
+    float* dst = part + ((size_t)(tok * QH + wave * 4 + j) * SPLITS + split) * (D + 2);
+    if (kk == 0 && tok < m) {
+      dst[D] = m_run[g];
+      dst[D + 1] = lt;
+    }
+  }
+}
+
+// One pass over all m verified tokens on the page partition (m <= 8).
+template <typename Pre>
+__device__ __forceinline__ void verify_attention_paged(const Layer& L, float* part, AttnShared& sm, int m, int a, Pre&& pre) {
+  if (m == 1) attention_v2<1>(L, part, sm, 0, m, a, pre);
+  else if (m == 2) attention_v2<2>(L, part, sm, 0, m, a, pre);
+  else if (m == 3) attention_v2<3>(L, part, sm, 0, m, a, pre);
+  else if (m == 4) attention_v3<4>(L, part, sm, m, a, pre);
+  else attention_v3<8>(L, part, sm, m, a, pre);
+}
+
 // y[t][qh][d] = gate(t, qh) * (sum_s fac_s acc_s) / (sum_s fac_s l_s). One (t, qh) task per pair of waves, one lane per dim: the two
 // pairs of a block run side by side, so 64 tasks over 60 blocks do not double the phase for the 4 blocks that get a second task.
 __device__ __forceinline__ void combine_phase(const float* mix, const float* part, __half* y, int start, int a, int m, bool gated,
@@ -1430,7 +2148,8 @@ __device__ __forceinline__ void combine_phase(const float* mix, const float* par
     const float* base = part + (size_t)task * SPLITS * (D + 2);
     int nq = min(m - (tok & ~3), 4);
     const int IT = gated ? 8 * (nq == 1 ? 4 : (nq == 2 ? 2 : 1)) : 8;
-    const int splits = max(1, min(a > start ? (a - 1) / IT - start / IT + 1 : 0, (int)gridDim.x));
+    const int splits = gated && use_paged(start, a, m) ? verify_splits(start, a)
+                                                     : max(1, min(a > start ? (a - 1) / IT - start / IT + 1 : 0, (int)gridDim.x));
     if (valid && lead) {
       // The (max, sum) of all splits fit on the first wave of the pair.
       f32x2 ml = {-INFINITY, 0.f};
@@ -1803,13 +2522,17 @@ __global__ __launch_bounds__(THREADS, 1) LFM3_KERNEL_ATTR void dspark_kernel(Glo
         if (b < m) query_fresh(*L, ws + WS_MIX, reinterpret_cast<int8_t*>(ws + WS_Q), sm.u.attn, b, a, wave, lane);
         arrive();
         trace_mark(g.trace, tn, 22);
-        for (int p0 = 0, nq = 0; p0 < m; p0 += nq) {
-          if (p0) __syncthreads();
-          nq = min(m - p0, 4);
-          if (drafter) attention_pass<1, true>(*L, ws + WS_MIX, ws + WS_PART, sm.u.attn, p0, nq, m, a, ctx_lo, false, g.trace, tn, wait_pending);
-          else if (nq == 1) attention_pass<4, false>(*L, ws + WS_MIX, ws + WS_PART, sm.u.attn, p0, nq, m, a, ctx_lo, true, g.trace, tn, wait_pending);
-          else if (nq == 2) attention_pass<2, false>(*L, ws + WS_MIX, ws + WS_PART, sm.u.attn, p0, nq, m, a, ctx_lo, true, g.trace, tn, wait_pending);
-          else attention_pass<1, false>(*L, ws + WS_MIX, ws + WS_PART, sm.u.attn, p0, nq, m, a, ctx_lo, true, g.trace, tn, wait_pending);
+        if (!drafter && use_paged(attn_start(kind, (int)L->window, a, ctx_lo), a, m)) {
+          verify_attention_paged(*L, ws + WS_PART, sm.u.attn, m, a, wait_pending);
+        } else {
+          for (int p0 = 0, nq = 0; p0 < m; p0 += nq) {
+            if (p0) __syncthreads();
+            nq = min(m - p0, 4);
+            if (drafter) attention_pass<1, true>(*L, ws + WS_MIX, ws + WS_PART, sm.u.attn, p0, nq, m, a, ctx_lo, false, g.trace, tn, wait_pending);
+            else if (nq == 1) attention_pass<4, false>(*L, ws + WS_MIX, ws + WS_PART, sm.u.attn, p0, nq, m, a, ctx_lo, true, g.trace, tn, wait_pending);
+            else if (nq == 2) attention_pass<2, false>(*L, ws + WS_MIX, ws + WS_PART, sm.u.attn, p0, nq, m, a, ctx_lo, true, g.trace, tn, wait_pending);
+            else attention_pass<1, false>(*L, ws + WS_MIX, ws + WS_PART, sm.u.attn, p0, nq, m, a, ctx_lo, true, g.trace, tn, wait_pending);
+          }
         }
         arrive();
         trace_mark(g.trace, tn, T_ATTN + TB);
@@ -2223,6 +2946,7 @@ __global__ __launch_bounds__(THREADS, 1) LFM3_KERNEL_ATTR void dspark_kernel(Glo
     }
   }
   __syncthreads();
+  trace_mark(g.trace, tn, 19);
 }
 
 }  // namespace lfm3ds

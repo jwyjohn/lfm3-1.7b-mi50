@@ -76,12 +76,15 @@ const (
 	sTokens
 )
 
-// Speculation policy, chosen by replaying fixed token sequences through the drafter.
+// Speculation policy: the threshold was chosen by replaying fixed token sequences through the
+// drafter; the switch to fewer drafts moved from 32768 to 57344 once verify attention became one
+// pass over all verified tokens (measured over 18 streams: 7 drafts win at 32k and 48k, 3 at 64k
+// and 128k, where a verified token still costs ~55 us per full-attention layer at 128k).
 const (
 	dsRoundsPerLaunch = 32
 	dsMaxDrafts       = 7
 	dsMaxDraftsLong   = 3 // from dsLongFrom on, where a verified token costs more
-	dsLongFrom        = 32768
+	dsLongFrom        = 57344
 	dsConfThreshold   = -0.4
 	dsMaxBudget       = 512
 )
@@ -147,6 +150,7 @@ type draftState struct {
 	projWeights           *kfd.Buffer
 	tapX, tapC, tapC2     *kfd.Buffer
 	tapKV                 *kfd.Buffer
+	trace                 *dsTracer
 
 	// tapFrom is the first position the running prefill captures, or -1.
 	tapFrom int
@@ -236,6 +240,9 @@ func (e *Engine) initDSpark(pay *payload.Payload, head *weights.Packed, targetRo
 	}
 	e.buildDraftLayers(targetRows)
 	e.buildDraftGlobals(&meta)
+	if err := e.initDraftTrace(); err != nil {
+		return err
+	}
 	return e.drain(kfd.ScopeAgent)
 }
 
@@ -547,6 +554,9 @@ func (e *Engine) draftLaunch(seq *sequence, budget int, eos int32, rep float32) 
 	s[sLimit], s[sBudget], s[sEOS] = uint32(limit), uint32(budget), uint32(eos)
 	s[sCtxNew], s[sCtxPos], s[sCtxLo] = uint32(d.ctxNew), uint32(d.ctxPos), uint32(d.ctxLo)
 	s[sRun] = 1
+	if d.trace != nil {
+		s[sRounds] = 4 // what the trace buffer holds whole
+	}
 	s[sMiss], s[sSkip] = uint32(d.miss), uint32(d.skip)
 	s[sSkipRounds] = 1
 	s[sStopAt], s[sCkptSlot] = uint32(stop), uint32(ckpt)
@@ -558,6 +568,9 @@ func (e *Engine) draftLaunch(seq *sequence, budget int, eos int32, rep float32) 
 	g.maxDrafts = dsMaxDrafts
 	if seq.longContext {
 		g.maxDrafts = dsMaxDraftsLong
+	}
+	if d.trace != nil {
+		e.armTrace(d.trace)
 	}
 	g.invRep = 1
 	if rep != 0 {
@@ -578,6 +591,9 @@ func (e *Engine) draftLaunch(seq *sequence, budget int, eos int32, rep float32) 
 	box := (*int32)(unsafe.Add(d.host.Ptr(), dsHostMarker))
 	atomic.StoreInt32(box, tokenPending)
 	maxOut := int32(min(limit-a, budget))
+	if d.trace != nil {
+		e.fetchTrace(d.trace)
+	}
 	e.uploadRaw(d.ctl.VA+dsCtlState, d.host.VA+dsHostState, dsStateWords)
 	e.uploadRaw(d.ctl.VA+dsCtlOut, d.host.VA+dsHostOut, maxOut)
 	e.upload(d.host.VA+dsHostMarker, []uint32{1})
@@ -591,6 +607,9 @@ func (e *Engine) draftLaunch(seq *sequence, budget int, eos int32, rep float32) 
 	n := atomic.LoadInt32(&st[sCount])
 	if n < 1 || n > maxOut {
 		return draftResult{}, fmt.Errorf("speculative decode: %d tokens from a launch of at most %d", n, maxOut)
+	}
+	if d.trace != nil {
+		d.trace.collect(int(st[sDone]))
 	}
 	d.ctxNew, d.ctxPos = st[sCtxNew], st[sCtxPos]
 	d.miss, d.skip = st[sMiss], st[sSkip]

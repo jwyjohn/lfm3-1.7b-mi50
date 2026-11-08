@@ -1,0 +1,61 @@
+DSpark verify attention, before (commit 3214314: attention_pass, passes of up to 4 tokens over 8 R-key tiles)
+and after (kernels/dspark.hip: attention_v2 for M <= 3, attention_v3 for M = 4..8, one pass over all verified
+tokens on the 32-key page partition). Random int8 KV cache in the engine's layout, 6 full-attention layers x 10
+reps per launch, per-layer time of query/fresh K/V + attention + combine (three grid phases), HIP events on the
+MI50 (power-capped at 178 W). Harness of the development tree (fa/dec/v3/ds.py, bench_ds over the megakernel's
+own device functions).
+
+Per-layer latency in us, before -> after (speed-up), by context (a) and verified tokens (M):
+  a   8192  M 1:   32.7 ->  26.4 (1.24x)   M 2:  32.6 ->  32.3 (1.01x)   M 3:  47.5 ->  38.3 (1.24x)
+            M 4:   49.9 ->  39.8 (1.25x)   M 8:  95.5 ->  64.9 (1.47x)
+  a  32768  M 1:   70.4 ->  65.0 (1.08x)   M 2:  87.3 ->  72.0 (1.21x)   M 3: 127.5 ->  93.8 (1.36x)
+            M 4:  132.1 ->  98.2 (1.35x)   M 8: 257.6 -> 163.3 (1.58x)
+  a 131000  M 1:  247.0 -> 210.0 (1.18x)   M 2: 288.2 -> 231.7 (1.24x)   M 3: 440.6 -> 311.7 (1.41x)
+            M 4:  451.9 -> 335.1 (1.35x)   M 8: 889.6 -> 557.3 (1.60x)
+  a  65536  M 1:  126.9 -> 114.0 (1.11x)   M 4: 234.5 -> 178.0 (1.32x)   M 8: 470.5 -> 295.6 (1.59x)
+  a   2048  M 1:   24.8 ->  17.4 (1.42x)   M 2:  19.9 ->  20.4 (0.97x)   M 3:  23.1 ->  24.0 (0.96x)
+            M 4:   24.9 ->  24.0 (1.04x)   M 8:  49.6 ->  41.6 (1.19x)
+  a   1024  M 1:   19.6 ->  13.7 (1.43x)   M 2:  17.5 ->  15.3 (1.15x)   M 3:  19.1 ->  18.2 (1.05x)
+            M 4:   20.3 ->  18.4 (1.11x)   M 8:  42.4 ->  29.5 (1.44x)
+  a    400  M 1:   17.7 ->  12.3 (1.44x)   M 2:  15.1 ->  14.1 (1.07x)   M 3:  16.8 ->  17.2 (0.98x)
+            M 4:   17.1 ->  16.9 (1.01x)   M 8:  33.5 ->  26.2 (1.28x)
+  sliding window 256 (a = 131000): M 1  17.9 -> 12.6, M 4  15.2 -> 15.7, M 8  27.4 -> 27.2
+  (below 12 pages and from M = 3 on, the old attention_pass still runs)
+
+Accuracy against an fp64 reference of the same int8 Q/K/V (a = 1 .. 131000, M = 1..9, window 0 and 256):
+worst relative error 3.80e-4 after, 3.79e-4 before.
+
+Memory floor at a = 131000: 138 MB of K/V per layer, 176 us at 785 GB/s. M = 1 is near it; every further
+token costs about 55 us per layer at 131000 (about 235 instructions per token and 32-key page per wave),
+which is the issue rate at the clock the power cap leaves:
+  attention_v3, M = 4, a = 131000, sustained          345.8 us/layer   sclk 1354 MHz   175 W
+  same without the page loads (stale data)              269.0 us/layer   sclk 1538 MHz   179 W
+  same without PV                                       266.6 us/layer   sclk 1333 MHz   179 W
+  same without the QK dot products                      291.6 us/layer   sclk 1383 MHz   178 W
+
+Inner loop per 32-key page and wave (instructions, from the ISA):
+  attention_v2 NT = 4                    1212      attention_v3 NT = 4    1166
+  attention_v2 for M = 8 (two passes)    2424      attention_v3 NT = 8    2096
+
+Policy: 7 drafts per round below dsLongFrom, 3 from there on. 18 streams per tier (each prompt minus its
+first 16 v tokens, v = 0..5), mean / median decode tok/s, before the SDWA conversion:
+  context   3 drafts        7 drafts
+  32k       627 / 532       668 / 611
+  48k       477 / 463       509 / 481
+  64k       468 / 462       436 / 431
+  128k      406 / 412       380 / 331
+dsLongFrom moved from 32768 to 57344. Confidence threshold, same streams:
+  32k, 7 drafts:   -0.6  546 / 527    -0.4  668 / 611    -0.2  597 / 502
+  128k, 3 drafts:  -0.6  366 / 333    -0.4  406 / 412    -0.2  382 / 361
+It stays at -0.4.
+
+End to end, 18 streams per tier (cmd/bench, 1024 output tokens, cold cache; the prompts minus their first
+16 v tokens), mean / median decode tok/s and the mean R, M and tau, before -> after:
+  1k     633 / 449 -> 788 / 758     R 4.24 -> 4.32 ms   M 4.61 -> 4.57   tau 2.72 -> 3.47
+  8k     620 / 496 -> 595 / 500     R 4.41 -> 4.46 ms   M 4.40 -> 4.57   tau 2.80 -> 2.69
+  32k    564 / 458 -> 671 / 614     R 4.88 -> 4.80 ms   M 3.92 -> 4.28   tau 2.84 -> 3.30
+  64k    472 / 467 -> 471 / 464     R 5.10 -> 4.79 ms   M 3.23 -> 3.13   tau 2.41 -> 2.25
+  128k   362 / 336 -> 410 / 415     R 6.09 -> 5.52 ms   M 3.05 -> 3.05   tau 2.22 -> 2.27
+R depends on M and on tau (the context projection and the commit grow with the accepted tokens), so per
+tier R was fitted as a + b M + c tau over the 18 streams, R at M = 4 and tau = 2.5:
+  1k 4.13 -> 4.18 ms, 8k 4.32 -> 4.32, 32k 4.93 -> 4.68, 64k 5.32 -> 5.01, 128k 6.59 -> 5.87

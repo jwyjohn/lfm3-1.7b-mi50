@@ -10,11 +10,11 @@
 
 | 上下文 | TTFT，vLLM → 本项目 | greedy decode tok/s，vLLM → 本项目 |
 |---|---|---|
-| 1k | 0.201 → 0.124 s | 974 → 1207 |
-| 32k | 5.829 → 4.617 s | 364 → 613 |
-| 128k | 44.738 → 28.739 s | 301 → 307 |
+| 1k | 0.201 → 0.124 s | 974 → 1174 |
+| 32k | 5.829 → 4.607 s | 364 → 688 |
+| 128k | 44.738 → 28.623 s | 301 → 424 |
 
-TTFT、prefill、热启动和采样路径在每一档都更好。prefill attention 的 PV 用 int8 计算，softmax 概率量化为 u8，速度是 fp16 版本的两倍；代价是长上下文的精度略有下降，`--exact-attention` 可以换回 fp16 kernel（见[正确性](#正确性)）。上表的 decode 是 3 条流的中位数，**受混沌影响很大，不能单独看**：72 条流的总体基本打平（均值 559 → 545），把落入重复循环的流分开后，正常文本每一档快 5% 到 16%。详见[评测](#评测)，优化全过程见[优化报告](docs/OPTIMIZATION_REPORT.md)。
+TTFT、prefill、热启动和采样路径在每一档都更好。prefill attention 的 PV 用 int8 计算，softmax 概率量化为 u8，速度是 fp16 版本的两倍；代价是长上下文的精度略有下降，`--exact-attention` 可以换回 fp16 kernel（见[正确性](#正确性)）。decode 的 verify attention 每层只读一遍 K/V cache，所有待验证 token 一起算，32k 和 128k 比之前快 1.2 到 1.6 倍，精度不变。上表的 decode 是 3 条流的中位数，**受混沌影响很大，不能单独看**：上一版的 72 条流总体和 vLLM 基本打平（均值 559 → 545），把落入重复循环的流分开后，正常文本每一档快 5% 到 16%；和上一版相比，现在每档 18 条流的均值 32k 564 → 671，128k 362 → 410。详见[评测](#评测)，优化全过程见[优化报告](docs/OPTIMIZATION_REPORT.md)。
 
 只有 `temperature: 0` 的请求走 DSpark。模型默认的 temperature 是 0.1，走采样路径，约 260 tok/s。这和 vLLM 行为一致。
 
@@ -117,7 +117,7 @@ head 裁剪用的 16384 个高频 token 已提交在 `cmd/pack/crop_ids.bin`。�
 
 Go 无法编译到 GPU，现有内核又经过大量调优，所以继续用 HIP C++，以 gfx906 code object 的形式通过 `go:embed` 嵌入：
 
-- `dspark.hip`：DSpark megakernel。一次 launch 在 GPU 上完成 draft、verify 和 commit，最多 32 轮。greedy 请求走这里。
+- `dspark.hip`：DSpark megakernel。一次 launch 在 GPU 上完成 draft、verify 和 commit，最多 32 轮。greedy 请求走这里。verify attention 对每个 32 key 的 K/V 页只读一次，所有待验证 token（最多 8 个）一起算，QK 用 int8，PV 用 fp16。
 - `decode.hip`：decode megakernel。一次持久 launch 跑完 24 层和 LM head，一次一个 token。采样、logprobs 和 `min_tokens` 的请求走这里。
 - `prefill_attn.hip`：基于分页 int8 KV cache 的 flash attention，QK 和 PV 都用 int8（softmax 概率按每 64 个 key 量化为 u8）。
 - `prefill_attn_exact.hip`：上一版 fp16 概率的 flash attention，供 `--exact-attention` 使用。
@@ -126,7 +126,7 @@ Go 无法编译到 GPU，现有内核又经过大量调优，所以继续用 HIP
 
 运行时不做任何编译。模型启动约 7.5 秒就绪，vLLM 部署约需 22 秒。
 
-编译好的内核（约 420 KB）提交在仓库里，这样只用 Go 工具链就能构建项目。
+编译好的内核（约 530 KB）提交在仓库里，这样只用 Go 工具链就能构建项目。
 
 Go 驱动没有 scratch 内存，所以 `dspark.hip` 必须用 `-mllvm -disable-machine-licm` 编译，并保持 `private_segment_fixed_size` 为 0。
 
@@ -136,7 +136,7 @@ decode 的钱主要花在读权重上，一次验证 M 个 token 也只读一遍
 
 和 vLLM 版本相比多了一点：verify 可以越过 32 token 的 block 边界，边界处的卷积状态由 kernel 从历史环里写一份。回放增益 0.6% 到 1.3%。
 
-策略（8k 以下最多 7 个 draft、32768 以上最多 3 个、置信度阈值 −0.4）由固定序列回放选出，不是看基准数字选的，原因见[评测](#评测)。
+策略（57344 以下最多 7 个 draft、57344 起最多 3 个、置信度阈值 −0.4）由固定序列回放选出，不是看基准数字选的，原因见[评测](#评测)。verify attention 改成一次覆盖全部待验证 token 之后，切换点从 32768 移到 57344：18 条流上，32k 和 48k 是 7 个 draft 更快，64k 和 128k 是 3 个更快（`benchmarks/verify_attention.txt`）。
 
 ### 把权重附加在 ELF 之后
 
@@ -171,6 +171,7 @@ full attention 的 KV 块按 LRU 淘汰。sliding attention 块和卷积检查�
 - **运行中会变化的数据必须由 GPU 写入。** 主机通过 BAR 写入会绕过 L2，L2 可能继续提供旧值，所以 `Engine.upload` 和 `Engine.loadToVRAM` 都经由 GPU 拷贝。
 - **doorbell 和 HDP 寄存器要用普通写入。** Go 的 `atomic.Store` 在 amd64 上是带锁的 `XCHG`。doorbell 的值是最后一个 packet 的 id，不是写指针。
 - **decode 内核曾有一处竞争，已修复。** 它在等待 grid barrier 之前就预取 `h_old`。这对其他层都安全，但第 0 层的 `h0` 正是上一阶段由 block 0 写入的，其他 block 可能读到上一个 token 的 embedding，导致整个 block 算错。在这个驱动下，它在超过 16 个 block 时出现。问题依赖时序：未修复的内核在 ROCr 下能通过同样的逐位比较测试，原因没有查明。修复只需要改 `decode.hip` 的一行。在 ROCr 下它使内核时间增加约 0.6%，33 个测评请求的前 256 个 greedy token 全部不变，所以 vLLM 与 HF 一致度较低并不是这个竞争造成的。
+- **grid barrier 之前发出的 load 只能读更早相位的数据。** DSpark 的 verify attention 在等待 query 相位之后的 barrier 之前，就先发出第一页的 load，让读取和等待重叠。待验证 token 的新 K/V 正是其他 block 在 query 相位写的，所以第一页就是新 K/V 页的 split（没有上下文页的 block 0，256 key 的滑动窗口层每层都是）必须在 barrier 之后才发。开发中的一个版本没有这样做，M = 2 的结果随时序变化（对 fp64 的最大误差 1.7e-3，正常是 3.8e-4）。
 - **acquire VM 之前要等一下。** 打开 render 节点会在内核里启动异步的页表更新。如果 `ACQUIRE_VM` 在约 1 毫秒内紧跟其后，这些更新会覆盖 KFD 为 trap handler 写入的页目录项。缺了这个映射，进程仍能正常运行，直到某个正在运行的 wave 被抢占，而任何进程的队列发生变化都会引发抢占：wave 取不到 trap handler，队列随之卡死。ROCr 两次调用之间的间隔足够长，所以不会遇到。这里的表现是在 vLLM 旁边启动时偶尔卡住，因为启动期间主机内存的 compaction 让 KFD 停止并重启了 vLLM 的队列。通过 debugfs 遍历页表看到该项缺失，加入 1 毫秒延迟后恢复正常。由于没有 ioctl 能等待这些更新，`kfd.Open` 会等 200 毫秒。
 - **prefill attention kernel 同样不能溢出。** 每个 block 512 线程，VGPR 上限 128，而驱动没有 scratch 内存。编写过程中有三种编译器行为造成溢出，代码里分别做了规避：barrier 之前算好的值被挪到 barrier 之后的使用处，导致所有已加载的操作数一直占着寄存器（logits 和累加器用空 `asm` 钉住）；两个分支里相同的 barrier 让编译器把两组 wave 的循环合并（两组的 barrier asm 不同）；同一对加载值的两半在两个条件下分别写出，被合并成一次写入并写错了一半（改为每个线程只加载一个 dword 到一个变量）。`kernels/build.sh` 遇到溢出或 scratch 会直接失败。
 - **不要占满显存。** 显存不足时，内核会把其他进程的缓冲区驱逐到主机内存，可能触发 OOM-killer。所以程序启动时先检查空闲显存，保留 512 MiB 余量，不足就拒绝启动，不会挤占别的进程。
@@ -229,13 +230,22 @@ docs/              优化报告
 
 | 上下文 | 输入 token | TTFT vLLM | TTFT 本项目 | prefill tok/s vLLM | prefill tok/s 本项目 | decode tok/s vLLM | decode tok/s 本项目 |
 |---|---|---|---|---|---|---|---|
-| 1k | 1024 | 0.201 s | 0.124 s | 5090 | 8230 | 974.2 | 1206.8 |
-| 8k | 8192 | 1.157 s | 0.983 s | 7082 | 8330 | 532.3 | 954.4 |
-| 32k | 32768 | 5.829 s | 4.617 s | 5622 | 7096 | 363.5 | 612.7 |
-| 64k | 65536 | 15.574 s | 11.187 s | 4208 | 5858 | 412.8 | 449.6 |
-| 128k | 126976 | 44.738 s | 28.739 s | 2838 | 4418 | 301.0 | 307.4 |
+| 1k | 1024 | 0.201 s | 0.124 s | 5090 | 8258 | 974.2 | 1174.0 |
+| 8k | 8192 | 1.157 s | 0.976 s | 7082 | 8396 | 532.3 | 436.1 |
+| 32k | 32768 | 5.829 s | 4.607 s | 5622 | 7112 | 363.5 | 687.9 |
+| 64k | 65536 | 15.574 s | 11.160 s | 4208 | 5873 | 412.8 | 435.0 |
+| 128k | 126976 | 44.738 s | 28.623 s | 2838 | 4436 | 301.0 | 423.7 |
 
-TTFT 和 prefill 来自 `benchmarks/lfm3-1.7b-mi50_cold.txt`，是换成 int8 PV 的 prefill attention 之后测的。decode 两列沿用之前那次（`benchmarks/lfm3-1.7b-mi50_cold_exact-attention.txt`，和 `--exact-attention` 的结果相同）：decode kernel 没有变，重新跑一次的 greedy 中位数会随下文说的重复循环"抽签"而变。attention kernel 本身在 128k prompt 上快 2.06 倍（全部层合计 32.6 s → 15.9 s），见 `benchmarks/prefill_attention.txt`。
+本项目的各列都来自 `benchmarks/lfm3-1.7b-mi50_cold.txt`，是 int8 PV 的 prefill attention 和一次完成的 verify attention 之后测的。上一版同一天的同一组请求（`benchmarks/lfm3-1.7b-mi50_cold_before-verify-attention.txt`）是 393.0、484.8、425.8、446.6、305.4：8k 和 64k 的中位数下降来自 τ，不是 R（见下一节），重跑一次输出的 token 完全相同。prefill attention kernel 本身在 128k prompt 上快 2.06 倍（全部层合计 32.6 s → 15.9 s），见 `benchmarks/prefill_attention.txt`。
+
+**Verify attention。** 每轮 verify 要对 M = 1 + draft 数个 token 在整个 cache 上做 attention。原来是每次最多 4 个 token 一遍，每遍都读完整的 K/V；现在每层一遍算完 M 个 token（M ≤ 3 用 `attention_v2`，M = 4 到 8 用 `attention_v3`）：一个 wave 把自己 KV head 的一个 32 key 页放进 LDS，64 条 lane 按 4 个 query head × 4 个 key × 4 个维度组划分，8 个 token 的 query 都放得进寄存器。131000 token 时每层耗时（µs，含 query 和 combine）：
+
+| M | 1 | 2 | 3 | 4 | 8 |
+|---|---|---|---|---|---|
+| 之前 | 247.0 | 288.2 | 440.6 | 451.9 | 889.6 |
+| 现在 | 210.0 | 231.7 | 311.7 | 335.1 | 557.3 |
+
+M = 1 已接近内存下限（176 µs）。128k 上每多一个 token 每层约多 55 µs，这是 178 W 功耗墙下的指令发射速度（K/V 读取同时进行时 sclk 约 1350 MHz）。每档 18 条流，相同 M 和 τ 下的 R 在 32k 降 5%、64k 降 6%、128k 降 11%，1k 和 8k 不变；decode 均值 32k 564 → 671，128k 362 → 410。详见 `benchmarks/verify_attention.txt` 和 `benchmarks/lfm3-1.7b-mi50_multistream_verify-attention.txt`。
 
 多轮对话回放，前缀缓存已预热（3 个会话，每个 3 轮），取 9 个请求的中位数，换 prefill attention 之前测：
 
@@ -287,7 +297,8 @@ MATH-500 和 GPQA-Diamond 各随机 20 题，thinking 开启，max_tokens 32768�
 | 分词器和 chat template，47 组抓取样例 | 逐 token 一致 |
 | 权重，6 个矩阵及 embedding、norm 与 Python 量化实现比对 | 逐字节一致 |
 | 确定性，prefill 和 decode 内核 | 多次运行 logits 逐位相同 |
-| 确定性，DSpark，15 个评测请求 | 不同运行的前 256 个 token 全部相同 |
+| 确定性，DSpark，15 个评测请求 | 不同运行的前 256 个 token 全部相同（verify attention 修改后重新验证） |
+| verify attention 对同一组 int8 Q/K/V 的 fp64 参考，上下文 1 到 131000，M = 1 到 9，窗口 0 和 256 | 最大相对误差 3.80e-4，和之前相同（3.79e-4） |
 | 抢占下的确定性，2000 步 decode，其间 130 个其他进程创建队列 | 逐位相同，无 GPU 故障（测于接入 DSpark 之前） |
 
 **prefill attention 的 softmax 概率是 u8。** P' = p × V scale 按每行、每 64 个 key 的 tile 相对 tile 内最大值量化，PV 用 `v_dot4` 计算。用 HF fp32 模型模拟 kernel 的量化方式，最后 192 个位置的下一 token 分布对 fp32 的 KL：16k 不变（0.00025），60k 从 0.0171 升到 0.0251（两个会话的均值；top-1 一致率 96.1% → 93.0%）。作为参照，较难的那个会话里仅 int8 KV cache 本身就有 0.031。旧 vLLM 部署按整行量化 P，导致长输出崩坏（KL 4.8）；按 tile 量化不会。`--exact-attention` 以一半的 attention 速度换回 fp16 P。细节见 `benchmarks/prefill_attention.txt`。
@@ -328,6 +339,10 @@ sudo build/diag -payload build/payload.bin -mode decode-timing
 # 抢占下的同一检查：运行期间其他进程不断创建队列
 sudo build/diag -payload build/payload.bin -mode decode-determinism -n 2000 &
 while [ -n "$(jobs -r)" ]; do sudo build/diag -mode queue-churn; done
+
+# DSpark 每个相位每轮的耗时，在每个请求结束时写进服务日志（开发用；开启时每次 launch 最多 4 轮）。
+# 数值是记录打点的 block。
+sudo env LFM3_DS_TRACE=7 ./dist/lfm3-1.7b-mi50 --port 18000
 
 # 单元测试。分词器相关测试需要 payload，没有时会跳过
 LFM3_PAYLOAD=$PWD/build/payload.bin go test ./...

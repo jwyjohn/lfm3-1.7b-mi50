@@ -183,6 +183,9 @@ func (e *Engine) Generate(req *Request, emit func(Step) bool) (*Result, error) {
 		more = deliver(next, step)
 	}
 	res.DecodeTime = time.Since(decodeStart)
+	if e.ds.trace != nil {
+		e.ds.trace.report()
+	}
 	return res, e.drain(kfd.ScopeAgent)
 }
 
